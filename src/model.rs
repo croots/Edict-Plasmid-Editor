@@ -130,6 +130,16 @@ impl FeatureRecord {
         }
     }
 
+    pub fn to_feature(&self) -> Feature {
+        let segments: Vec<(usize, usize)> = self.segments.iter().map(|g| (g[0], g[1])).collect();
+        let source = segments_location(&segments, self.strand).map(|location| GbFeature {
+            kind: self.kind.clone().into(),
+            location,
+            qualifiers: self.qualifiers.iter().map(|(k, v)| (k.clone().into(), v.clone())).collect(),
+        });
+        Feature { kind: self.kind.clone(), label: self.label.clone(), segments, strand: self.strand, source }
+    }
+
     /// The span from its first base to its last.
     pub fn extent(&self) -> Option<(usize, usize)> {
         let s = self.segments.iter().map(|g| g[0]).min()?;
@@ -168,6 +178,20 @@ pub enum Op {
     LinkStructure { id: String, name: String, before: pgx::ChainLinking, after: pgx::ChainLinking },
     /// The record took a new name (Save As).
     Rename { before: String, after: String },
+    /// Logged just before a step's base edits: the features, as they were before it,
+    /// that the edits changed other than by moving them (cut short, dropped, given a
+    /// new translation, split at a new origin). With it, reading the log backwards
+    /// restores features exactly. `all` replaces the whole list; `changed` lists
+    /// (index, feature).
+    Features {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed: Vec<(usize, FeatureRecord)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        all: Option<Vec<FeatureRecord>>,
+    },
+    /// The changes that follow, up to the next step, put the document back as it was
+    /// at revision `to`.
+    Revert { to: u64 },
 }
 
 impl Op {
@@ -189,8 +213,13 @@ impl Op {
                 Op::LinkStructure { id: id.clone(), name: name.clone(), before: *after, after: *before }
             }
             Op::Rename { before, after } => Op::Rename { before: after.clone(), after: before.clone() },
-            Op::AttachStructure { .. } | Op::RemoveStructure { .. } => return None,
+            Op::AttachStructure { .. } | Op::RemoveStructure { .. } | Op::Features { .. } | Op::Revert { .. } => return None,
         })
+    }
+
+    /// Records kept for reading the log backwards, not changes in their own right.
+    pub fn is_bookkeeping(&self) -> bool {
+        matches!(self, Op::Features { .. })
     }
 
     /// Undo steps only hold sequence and feature changes, which always reverse.
@@ -440,17 +469,19 @@ impl Document {
             return;
         }
         let before = self.snapshot();
-        let op = self.apply_insert(pos, bases);
-        self.changed(before, vec![op]);
+        let ops = self.apply_insert(pos, bases);
+        self.changed(before, ops);
     }
 
-    fn apply_insert(&mut self, pos: usize, bases: &[u8]) -> Op {
+    fn apply_insert(&mut self, pos: usize, bases: &[u8]) -> Vec<Op> {
         let n = bases.len();
         Rc::make_mut(&mut self.seq).splice(pos..pos, bases.iter().copied());
         let mut touched = Vec::new();
+        let mut was = Vec::new();
         for (fi, f) in Rc::make_mut(&mut self.features).iter_mut().enumerate() {
             if f.segments.iter().any(|&(s, e)| s < pos && pos < e) {
                 touched.push(fi);
+                was.push((fi, FeatureRecord::of(f)));
             }
             for (s, e) in f.segments.iter_mut() {
                 if pos <= *s {
@@ -462,7 +493,7 @@ impl Document {
             }
         }
         self.reencode(&touched);
-        Op::Insert { pos, bases: String::from_utf8_lossy(bases).into_owned() }
+        with_features(was, Op::Insert { pos, bases: String::from_utf8_lossy(bases).into_owned() })
     }
 
     /// Delete `[a, b)`. Features shrink; ones left empty are removed.
@@ -471,8 +502,8 @@ impl Document {
             return;
         }
         let before = self.snapshot();
-        let op = self.apply_delete(a, b);
-        self.changed(before, vec![op]);
+        let ops = self.apply_delete(a, b);
+        self.changed(before, ops);
     }
 
     /// Delete `[start, len)` and `[0, end)` of a circular sequence: a selection that
@@ -488,15 +519,15 @@ impl Document {
         let mut ops = Vec::new();
         // The tail first, so the head's coordinates still hold.
         if start < len {
-            ops.push(self.apply_delete(start, len));
+            ops.extend(self.apply_delete(start, len));
         }
         if end > 0 {
-            ops.push(self.apply_delete(0, end));
+            ops.extend(self.apply_delete(0, end));
         }
         self.changed(before, ops);
     }
 
-    fn apply_delete(&mut self, a: usize, b: usize) -> Op {
+    fn apply_delete(&mut self, a: usize, b: usize) -> Vec<Op> {
         let n = b - a;
         let removed: Vec<u8> = Rc::make_mut(&mut self.seq).drain(a..b).collect();
         let map = |x: usize| if x <= a { x } else if x >= b { x - n } else { a };
@@ -504,8 +535,13 @@ impl Document {
         let mut kept = Vec::with_capacity(features.len());
         // Surviving features the deletion cut into, by their new index.
         let mut touched = Vec::new();
-        for mut f in std::mem::take(features) {
+        // Features the deletion cut into or dropped, as they were, by their old index.
+        let mut was = Vec::new();
+        for (fi, mut f) in std::mem::take(features).into_iter().enumerate() {
             let hit = f.segments.iter().any(|&(s, e)| a < e && s < b);
+            if hit {
+                was.push((fi, FeatureRecord::of(&f)));
+            }
             for seg in f.segments.iter_mut() {
                 *seg = (map(seg.0), map(seg.1));
             }
@@ -520,7 +556,7 @@ impl Document {
         }
         *features = kept;
         self.reencode(&touched);
-        Op::Delete { pos: a, bases: String::from_utf8_lossy(&removed).into_owned() }
+        with_features(was, Op::Delete { pos: a, bases: String::from_utf8_lossy(&removed).into_owned() })
     }
 
     /// The feature as the document stores it: coding features carry their frame, table
@@ -617,6 +653,7 @@ impl Document {
             return;
         }
         let before = self.snapshot();
+        let all = Op::Features { changed: Vec::new(), all: Some(self.features.iter().map(FeatureRecord::of).collect()) };
         let moved: Vec<u8> = self.seq[..origin].to_vec();
         Rc::make_mut(&mut self.seq).rotate_left(origin);
         let shift = |x: usize| (x + len - origin) % len;
@@ -643,7 +680,7 @@ impl Document {
             f.segments = merged;
         }
         let bases = String::from_utf8_lossy(&moved).into_owned();
-        let ops = vec![Op::Delete { pos: 0, bases: bases.clone() }, Op::Insert { pos: len - origin, bases }];
+        let ops = vec![all, Op::Delete { pos: 0, bases: bases.clone() }, Op::Insert { pos: len - origin, bases }];
         self.changed(before, ops);
     }
 
@@ -684,6 +721,85 @@ impl Document {
         self.changed_for_good(Op::RemoveStructure { id: s.id, name: s.name });
     }
 
+    /// The bases and features as they were at revision `rev`, read back from the log
+    /// starting at the current state. Exact for edits this build logged; features
+    /// changed by base edits in older logs come back as close as the log allows.
+    /// Structures aren't covered: the log doesn't hold their files.
+    pub fn state_at(&self, rev: u64) -> (Vec<u8>, Vec<Feature>) {
+        let mut seq = self.seq.to_vec();
+        let mut fs = self.features.to_vec();
+        let h = &self.history;
+        for i in (0..h.len()).rev() {
+            if h[i].rev <= rev {
+                break;
+            }
+            let changed: &[(usize, FeatureRecord)] = match i.checked_sub(1).map(|j| &h[j].op) {
+                Some(Op::Features { changed, .. }) => changed,
+                _ => &[],
+            };
+            match &h[i].op {
+                Op::Insert { pos, bases } => {
+                    if pos + bases.len() <= seq.len() {
+                        seq.drain(*pos..pos + bases.len());
+                    }
+                }
+                Op::Delete { pos, bases } => {
+                    let pos = (*pos).min(seq.len());
+                    seq.splice(pos..pos, bases.bytes());
+                }
+                _ => {}
+            }
+            fs = features_before(fs, &h[i].op, changed);
+        }
+        (seq, fs)
+    }
+
+    /// Put the bases and features back as they were at revision `rev`, as one undo
+    /// step. Attached structures stay as they are. False if nothing would change.
+    pub fn revert_to(&mut self, rev: u64) -> bool {
+        if rev >= self.revision {
+            return false;
+        }
+        let (seq, features) = self.state_at(rev);
+        let now: Vec<FeatureRecord> = self.features.iter().map(FeatureRecord::of).collect();
+        let then: Vec<FeatureRecord> = features.iter().map(FeatureRecord::of).collect();
+        if seq == *self.seq && now == then {
+            return false;
+        }
+        let mut ops = vec![Op::Revert { to: rev }];
+        if seq != *self.seq {
+            // The base edits are logged as the bases that differ; the feature steps
+            // below then run from the current features to the old ones.
+            ops.push(Op::Features { changed: Vec::new(), all: Some(now.clone()) });
+            let cur = &self.seq[..];
+            let p = cur.iter().zip(&seq).take_while(|(x, y)| x == y).count();
+            let s = cur[p..].iter().rev().zip(seq[p..].iter().rev()).take_while(|(x, y)| x == y).count();
+            let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            if p + s < cur.len() {
+                ops.push(Op::Delete { pos: p, bases: text(&cur[p..cur.len() - s]) });
+            }
+            if p + s < seq.len() {
+                ops.push(Op::Insert { pos: p, bases: text(&seq[p..seq.len() - s]) });
+            }
+        }
+        for (ix, (b, a)) in now.iter().zip(&then).enumerate() {
+            if b != a {
+                ops.push(Op::EditFeature { ix, before: b.clone(), after: a.clone() });
+            }
+        }
+        for ix in (then.len()..now.len()).rev() {
+            ops.push(Op::RemoveFeature { ix, feature: now[ix].clone() });
+        }
+        for ix in now.len()..then.len() {
+            ops.push(Op::AddFeature { ix, feature: then[ix].clone() });
+        }
+        let before = self.snapshot();
+        self.seq = Rc::new(seq);
+        self.features = Rc::new(features);
+        self.changed(before, ops);
+        true
+    }
+
     pub fn undo(&mut self) -> bool {
         self.step(true)
     }
@@ -698,15 +814,26 @@ impl Document {
         let popped = if undo { self.undo.pop() } else { self.redo.pop() };
         let Some((snap, ops)) = popped else { return false };
         let current = self.snapshot();
+        // The step's own bookkeeping described the state before it, not this one.
+        let replay = |op: &&Op| !op.is_bookkeeping() && !(undo && matches!(op, Op::Revert { .. }));
+        let logged: Vec<Op> = if undo {
+            ops.iter().rev().filter(replay).map(Op::inverse).collect()
+        } else {
+            ops.iter().filter(replay).cloned().collect()
+        };
+        // Restoring a snapshot can bring back features the base edits had cut or
+        // dropped. If reading the log backwards wouldn't get today's features back,
+        // the log keeps them as they are.
+        let back = logged.iter().rev().fold(snap.features.to_vec(), |fs, op| features_before(fs, op, &[]));
+        if !back.iter().map(FeatureRecord::of).eq(self.features.iter().map(FeatureRecord::of)) {
+            self.log(Op::Features { changed: Vec::new(), all: Some(self.features.iter().map(FeatureRecord::of).collect()) });
+        }
+        for op in logged {
+            self.log(op);
+        }
         if undo {
-            for op in ops.iter().rev() {
-                self.log(op.inverse());
-            }
             self.redo.push((current, ops));
         } else {
-            for op in &ops {
-                self.log(op.clone());
-            }
             self.undo.push((current, ops));
         }
         self.seq = snap.seq;
@@ -883,6 +1010,82 @@ fn collect_segments(loc: &Location, out: &mut Vec<(usize, usize)>, strand: &mut 
 
 /// GenBank files usually carry a `gene` and a `CDS` over the same span; drawing both
 /// doubles the annotation lanes for no information.
+/// A base edit, preceded by the features it changed beyond moving them, if any.
+fn with_features(changed: Vec<(usize, FeatureRecord)>, op: Op) -> Vec<Op> {
+    if changed.is_empty() {
+        vec![op]
+    } else {
+        vec![Op::Features { changed, all: None }, op]
+    }
+}
+
+/// The features before logged step `op`, given the ones after it. `changed` is the
+/// [`Op::Features`] record logged just before it, if any.
+fn features_before(mut fs: Vec<Feature>, op: &Op, changed: &[(usize, FeatureRecord)]) -> Vec<Feature> {
+    match op {
+        Op::Insert { pos, bases } => return uninsert(fs, *pos, bases.len(), changed),
+        Op::Delete { pos, bases } => return undelete(fs, *pos, bases.len(), changed),
+        Op::AddFeature { ix, .. } if *ix < fs.len() => {
+            fs.remove(*ix);
+        }
+        Op::RemoveFeature { ix, feature } => fs.insert((*ix).min(fs.len()), feature.to_feature()),
+        Op::EditFeature { ix, before, .. } if *ix < fs.len() => fs[*ix] = before.to_feature(),
+        Op::Features { all: Some(all), .. } => return all.iter().map(FeatureRecord::to_feature).collect(),
+        _ => {}
+    }
+    fs
+}
+
+/// The features before inserting `n` bases at `pos`, given the ones after: features
+/// past it move back, and `changed` restores the ones the insert changed.
+fn uninsert(mut fs: Vec<Feature>, pos: usize, n: usize, changed: &[(usize, FeatureRecord)]) -> Vec<Feature> {
+    let back = |x: usize| if x >= pos + n { x - n } else { x.min(pos) };
+    for f in fs.iter_mut() {
+        for seg in f.segments.iter_mut() {
+            *seg = (back(seg.0), back(seg.1));
+        }
+        f.segments.retain(|(s, e)| s < e);
+    }
+    fs.retain(|f| !f.segments.is_empty());
+    for (ix, rec) in changed {
+        if let Some(f) = fs.get_mut(*ix) {
+            *f = rec.to_feature();
+        }
+    }
+    fs
+}
+
+/// The features before deleting `n` bases at `pos`, given the ones after. `changed`
+/// holds, by their old index, every feature the delete cut into or dropped; the rest
+/// only moved.
+fn undelete(fs: Vec<Feature>, pos: usize, n: usize, changed: &[(usize, FeatureRecord)]) -> Vec<Feature> {
+    let end = pos + n;
+    let mut after = fs.into_iter().peekable();
+    let mut changed = changed.iter().peekable();
+    let mut out = Vec::new();
+    loop {
+        if let Some((_, rec)) = changed.next_if(|(ix, _)| *ix <= out.len()) {
+            // A feature the delete cut into survives as the next one after it.
+            let dropped = rec.segments.iter().all(|g| pos <= g[0] && g[1] <= end);
+            if !dropped {
+                after.next();
+            }
+            out.push(rec.to_feature());
+        } else if let Some(mut f) = after.next() {
+            for seg in f.segments.iter_mut() {
+                if seg.0 >= pos {
+                    *seg = (seg.0 + n, seg.1 + n);
+                }
+            }
+            out.push(f);
+        } else if let Some((_, rec)) = changed.next() {
+            out.push(rec.to_feature());
+        } else {
+            return out;
+        }
+    }
+}
+
 fn hide_redundant_genes(features: &mut Vec<Feature>) {
     let cds: std::collections::HashSet<Vec<(usize, usize)>> =
         features.iter().filter(|f| f.kind == "CDS").map(|f| f.segments.clone()).collect();
@@ -1033,6 +1236,71 @@ mod tests {
         assert_eq!(d.history.last().unwrap().op, Op::Rename { before: "log".into(), after: "log2".into() });
     }
 
+    fn state(seq: &[u8], fs: &[Feature]) -> (Vec<u8>, Vec<FeatureRecord>) {
+        (seq.to_vec(), fs.iter().map(FeatureRecord::of).collect())
+    }
+
+    #[test]
+    fn every_revision_can_be_read_back_and_reverted_to() {
+        let mut d = doc("ATGAAACCCGGGTTTTAAATGCCCTAG", vec![(0, 18), (3, 9), (18, 27), (12, 15)]);
+        d.circular = true;
+        let mut seen = vec![(d.revision, state(&d.seq, &d.features))];
+        let mut step = |d: &mut Document, f: &dyn Fn(&mut Document)| {
+            f(d);
+            seen.push((d.revision, state(&d.seq, &d.features)));
+        };
+        step(&mut d, &|d| d.insert(6, b"GGG")); // inside two coding features: new translations
+        step(&mut d, &|d| d.delete(3, 12)); // drops one feature, cuts another
+        step(&mut d, &|d| d.delete(14, 17)); // drops one between survivors
+        step(&mut d, &|d| d.add_feature(Feature { kind: "misc_feature".into(), label: "tag".into(), segments: vec![(1, 4)], strand: -1, source: None }));
+        step(&mut d, &|d| d.set_origin(5)); // rewrites every feature, splits one
+        step(&mut d, &|d| {
+            d.undo();
+        });
+        step(&mut d, &|d| {
+            d.redo();
+        });
+        step(&mut d, &|d| d.delete_across_origin(d.len() - 2, 2));
+        step(&mut d, &|d| {
+            d.undo();
+        });
+        step(&mut d, &|d| d.remove_feature(0));
+
+        for (rev, want) in &seen {
+            let (seq, fs) = d.state_at(*rev);
+            assert_eq!(&state(&seq, &fs), want, "revision {rev}");
+        }
+
+        // Revert to the start, then to a middle revision: each is one undo step, and
+        // the log still reads back exactly through the reverts.
+        let (start, mid) = (seen[0].clone(), seen[4].clone());
+        assert!(d.revert_to(start.0));
+        assert_eq!(state(&d.seq, &d.features), start.1);
+        assert!(!d.revert_to(start.0), "already there");
+        let after_first = (d.revision, state(&d.seq, &d.features));
+        assert!(d.revert_to(mid.0));
+        assert_eq!(state(&d.seq, &d.features), mid.1);
+        assert!(matches!(d.history.iter().rev().find(|e| matches!(e.op, Op::Revert { .. })).unwrap().op, Op::Revert { to } if to == mid.0));
+        d.undo();
+        assert_eq!(state(&d.seq, &d.features), after_first.1);
+        for (rev, want) in seen.iter().chain([&after_first]) {
+            let (seq, fs) = d.state_at(*rev);
+            assert_eq!(&state(&seq, &fs), want, "revision {rev} after reverting");
+        }
+
+        // The log as saved reads back the same way.
+        let dir = std::env::temp_dir().join("plasmid-gpui-revert");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revert.pgx");
+        d.set_path(&path).unwrap();
+        d.save().unwrap();
+        let back = Document::open(&path).unwrap();
+        for (rev, want) in &seen {
+            let (seq, fs) = back.state_at(*rev);
+            assert_eq!(&state(&seq, &fs), want, "revision {rev} after reopening");
+        }
+    }
+
     #[test]
     fn insert_shifts_and_grows_features() {
         let mut d = doc("AAAACCCCGGGG", vec![(4, 8), (8, 12), (0, 2)]);
@@ -1109,11 +1377,12 @@ mod tests {
         assert_eq!(&d.seq[..], b"CCGG");
         assert_eq!(d.features.len(), 1);
         assert_eq!(d.features[0].segments, vec![(0, 4)]);
-        assert_eq!(d.history.len(), 2);
+        let changes = |d: &Document| d.history.iter().filter(|e| !e.op.is_bookkeeping()).count();
+        assert_eq!(changes(&d), 2);
         assert!(d.undo());
         assert_eq!(&d.seq[..], b"AACCGGTT");
         assert_eq!(d.features.len(), 3);
-        assert_eq!(d.history.len(), 4);
+        assert_eq!(changes(&d), 4);
         assert!(!d.undo());
         assert!(d.redo());
         assert_eq!(&d.seq[..], b"CCGG");

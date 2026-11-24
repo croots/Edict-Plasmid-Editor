@@ -6,16 +6,20 @@
 //! saves into one entry showing its net effect, so typing a base and deleting it again
 //! leaves nothing, and an entry expands to the individual changes. Clicking selects
 //! where a change sits in today's sequence, found by carrying its position forward
-//! through every later edit.
+//! through every later edit. Right-clicking offers reverting the document to the
+//! version before or after an entry, as one undo step.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{div, prelude::*, px, uniform_list, Context, Entity, FontWeight, Hsla, SharedString, Subscription, Window};
+use gpui::{
+    anchored, deferred, div, prelude::*, px, uniform_list, Context, Entity, FontWeight, Hsla, MouseButton, MouseDownEvent, Pixels,
+    Point, SharedString, Subscription, Window,
+};
 
-use crate::editor::{editor_font, thousands, SeqEditor};
+use crate::editor::{editor_font, menu_panel, thousands, SeqEditor};
 use crate::model::{Edit, FeatureRecord, Format, Op};
 use crate::pgx::{ChainLinking, SavePoint};
 use crate::theme;
@@ -105,7 +109,8 @@ fn is_feature(op: &Op) -> bool {
 
 impl Summary {
     pub fn describe(&self) -> String {
-        let mut parts: Vec<String> = self.net.iter().map(Net::describe).collect();
+        let reverts = self.other.iter().filter(|o| matches!(o, Op::Revert { .. })).map(summary);
+        let mut parts: Vec<String> = reverts.chain(self.net.iter().map(Net::describe)).collect();
         let kinds: [(fn(&Op) -> bool, &str); 3] = [
             (|o| matches!(o, Op::AddFeature { .. }), "added"),
             (|o| matches!(o, Op::RemoveFeature { .. }), "removed"),
@@ -119,7 +124,7 @@ impl Summary {
                 many => parts.push(format!("{} features {verb}", many.len())),
             }
         }
-        parts.extend(self.other.iter().filter(|o| !is_feature(o)).map(summary));
+        parts.extend(self.other.iter().filter(|o| !is_feature(o) && !matches!(o, Op::Revert { .. })).map(summary));
         if parts.is_empty() {
             "No net change".into()
         } else {
@@ -148,7 +153,7 @@ fn unapply(seq: &mut Vec<u8>, op: &Op) {
 /// undo logs the exact inverse of the step it undid, and the two cancel.
 fn surviving(edits: &[Edit]) -> Vec<Op> {
     let mut kept: Vec<Op> = Vec::new();
-    for e in edits.iter().filter(|e| !e.op.is_sequence()) {
+    for e in edits.iter().filter(|e| !e.op.is_sequence() && !e.op.is_bookkeeping()) {
         let cancels = e.op.reversal().and_then(|inv| kept.iter().rposition(|k| *k == inv));
         match cancels {
             Some(i) => {
@@ -216,16 +221,30 @@ pub enum Row {
     Start { edits: usize },
 }
 
-pub fn rows(groups: &[Group], expanded: &HashSet<u64>, edits: usize) -> Vec<Row> {
+/// The list's lines. Bookkeeping entries (see [`Op::is_bookkeeping`]) aren't shown.
+pub fn rows(history: &[Edit], groups: &[Group], expanded: &HashSet<u64>) -> Vec<Row> {
     let mut out = Vec::new();
     for (g, group) in groups.iter().enumerate() {
         out.push(Row::Group { g });
         if expanded.contains(&group.id()) {
-            out.extend(group.edits.clone().rev().map(|ix| Row::Edit { ix }));
+            out.extend(group.edits.clone().rev().filter(|&ix| !history[ix].op.is_bookkeeping()).map(|ix| Row::Edit { ix }));
         }
     }
-    out.push(Row::Start { edits });
+    out.push(Row::Start { edits: changes(history) });
     out
+}
+
+/// How many of `edits` are changes shown in the list.
+fn changes(edits: &[Edit]) -> usize {
+    edits.iter().filter(|e| !e.op.is_bookkeeping()).count()
+}
+
+/// The revision just before `history[ix]`: the state a revert to "before it" restores.
+fn rev_before(history: &[Edit], ix: usize) -> u64 {
+    match ix.checked_sub(1) {
+        Some(p) => history[p].rev,
+        None => history.first().map_or(0, |e| e.rev.saturating_sub(1)),
+    }
 }
 
 /// Carry `[s, e)` across `op` the way the document moves feature segments: an insert at
@@ -309,6 +328,8 @@ pub fn summary(op: &Op) -> String {
         Op::RemoveStructure { name, .. } => format!("Removed structure “{name}”"),
         Op::LinkStructure { name, after, .. } => format!("Linked “{name}” by {}", linking(*after)),
         Op::Rename { before, after } => format!("Renamed “{before}” to “{after}”"),
+        Op::Revert { to } => format!("Reverted to revision {}", thousands(*to as usize)),
+        Op::Features { .. } => "Recorded features".into(),
     }
 }
 
@@ -350,12 +371,14 @@ fn detail(op: &Op) -> String {
             }
         }
         Op::LinkStructure { before, .. } => format!("was linked by {}", linking(*before)),
-        Op::RemoveStructure { .. } | Op::Rename { .. } => String::new(),
+        Op::Revert { .. } => "the bases and features as they were; the changes below did it".into(),
+        Op::RemoveStructure { .. } | Op::Rename { .. } | Op::Features { .. } => String::new(),
     }
 }
 
 fn mark(op: &Op) -> (&'static str, Hsla) {
     match op {
+        Op::Revert { .. } => ("↺", theme::accent()),
         Op::Insert { .. } | Op::AddFeature { .. } | Op::AttachStructure { .. } => ("+", theme::accent()),
         Op::Delete { .. } | Op::RemoveFeature { .. } | Op::RemoveStructure { .. } => ("−", theme::error()),
         _ => ("~", theme::muted_text()),
@@ -429,19 +452,120 @@ struct Built {
     history: Rc<[Edit]>,
 }
 
+/// One entry of a row's right-click menu: put the document back as it was at `rev`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Revert {
+    pub label: &'static str,
+    pub rev: u64,
+    /// The version, for the status line: "Reverted to {what}".
+    pub what: String,
+}
+
+/// The reverts row `row` offers, for a document at `revision`. Reverting to the
+/// current revision would do nothing, so it isn't offered.
+pub fn reverts(row: Row, groups: &[Group], history: &[Edit], revision: u64, now: u64) -> Vec<Revert> {
+    let mut out = Vec::new();
+    let mut offer = |label, rev: u64, what: String| {
+        if rev < revision {
+            out.push(Revert { label, rev, what });
+        }
+    };
+    match row {
+        Row::Group { g } => {
+            let group = &groups[g];
+            let before = rev_before(history, group.edits.start);
+            match &group.save {
+                Some(s) => {
+                    let saved = when(s.time, now);
+                    offer("Revert to this save", s.rev, format!("the version saved {saved}"));
+                    offer("Revert to before this save", before, format!("the version before the save {saved}"));
+                }
+                None if group.edits.start == 0 => offer("Discard all changes", before, "the start of the history".into()),
+                None => offer("Discard unsaved changes", before, "the last saved version".into()),
+            }
+        }
+        Row::Edit { ix } => {
+            let rev = history[ix].rev;
+            offer("Revert to just after this change", rev, format!("revision {}", thousands(rev as usize)));
+            offer("Revert to just before this change", rev_before(history, ix), format!("just before revision {}", thousands(rev as usize)));
+        }
+        Row::Start { .. } if !history.is_empty() => {
+            offer("Revert to the start of history", rev_before(history, 0), "the start of the history".into())
+        }
+        Row::Start { .. } => {}
+    }
+    out
+}
+
+struct Menu {
+    position: Point<Pixels>,
+    items: Vec<Revert>,
+}
+
 pub struct HistoryView {
     editor: Entity<SeqEditor>,
     built: Option<Built>,
     memo: HashMap<(usize, usize), Rc<Summary>>,
     expanded: HashSet<u64>,
     selected: Option<Selected>,
+    menu: Option<Menu>,
     _observe: Subscription,
 }
 
 impl HistoryView {
     pub fn new(editor: Entity<SeqEditor>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&editor, |_, _, cx| cx.notify());
-        Self { editor, built: None, memo: HashMap::new(), expanded: HashSet::new(), selected: None, _observe: observe }
+        Self { editor, built: None, memo: HashMap::new(), expanded: HashSet::new(), selected: None, menu: None, _observe: observe }
+    }
+
+    fn open_menu(&mut self, row: Row, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let (groups, _, history) = self.build(cx);
+        let groups: Vec<Group> = groups.iter().map(|(g, _)| g.clone()).collect();
+        let revision = self.editor.read(cx).doc.revision;
+        let items = reverts(row, &groups, &history, revision, now());
+        self.menu = (!items.is_empty()).then_some(Menu { position, items });
+        cx.notify();
+    }
+
+    fn revert(&mut self, item: &Revert, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.selected = None;
+        self.editor.update(cx, |ed, cx| ed.revert_to(item.rev, &item.what, cx));
+        cx.notify();
+    }
+
+    fn menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let menu = self.menu.as_ref()?;
+        let items = menu.items.iter().enumerate().map(|(i, item)| {
+            let item = item.clone();
+            div()
+                .id(("history-revert", i))
+                .flex()
+                .flex_row()
+                .gap_6()
+                .px_3()
+                .py(px(3.0))
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .child(div().flex_1().child(item.label))
+                .child(div().text_xs().text_color(theme::muted_text()).child(format!("rev {}", thousands(item.rev as usize))))
+                .on_click(cx.listener(move |this, _, _, cx| this.revert(&item, cx)))
+        });
+        Some(
+            deferred(
+                anchored().position(menu.position).snap_to_window_with_margin(px(8.0)).child(
+                    menu_panel()
+                        .id("history-menu")
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.menu = None;
+                            cx.notify();
+                        }))
+                        .children(items),
+                ),
+            )
+            .with_priority(1),
+        )
     }
 
     fn build(&mut self, cx: &mut Context<Self>) -> (Rc<Vec<(Group, Rc<Summary>)>>, Rc<Vec<Row>>, Rc<[Edit]>) {
@@ -453,7 +577,7 @@ impl HistoryView {
         }
         let gs = groups(&doc.history, &doc.saves);
         let sums = summarize(&doc.history, &gs, &doc.seq, &mut self.memo);
-        let rows = Rc::new(rows(&gs, &self.expanded, doc.history.len()));
+        let rows = Rc::new(rows(&doc.history, &gs, &self.expanded));
         let groups: Rc<Vec<_>> = Rc::new(gs.into_iter().zip(sums).collect());
         let history: Rc<[Edit]> = doc.history.clone().into();
         self.built = Some(Built { key, groups: groups.clone(), rows: rows.clone(), history: history.clone() });
@@ -553,12 +677,13 @@ impl Render for HistoryView {
                 range
                     .map(|i| {
                         let base = div().id(("history-row", i)).h(px(ROW_H)).px_3().flex().flex_row().items_center().gap_2();
-                        match rows[i] {
+                        let row = rows[i];
+                        let el = match row {
                             Row::Group { g } => {
                                 let (group, sum) = &groups[g];
                                 let open = expanded.contains(&group.id());
                                 let is_selected = selected == Some(Selected::Group(group.id()));
-                                let n = group.edits.len();
+                                let n = changes(&history[group.edits.clone()]);
                                 let (title, color, time): (SharedString, Hsla, u64) = match &group.save {
                                     Some(s) => (
                                         s.label.as_ref().map_or("Saved".into(), |l| format!("Saved · {l}").into()),
@@ -631,7 +756,11 @@ impl Render for HistoryView {
                                     format!("Start of history · {} change{}", thousands(edits), if edits == 1 { "" } else { "s" })
                                 },
                             ),
-                        }
+                        };
+                        el.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| this.open_menu(row, ev.position, cx)),
+                        )
                     })
                     .collect()
             }),
@@ -646,6 +775,7 @@ impl Render for HistoryView {
             .text_color(theme::text())
             .children(notice)
             .child(list)
+            .children(self.menu(cx))
     }
 }
 
@@ -691,10 +821,10 @@ mod tests {
         assert_eq!(groups(&[], &[save(0)]), vec![]);
 
         let mut open = HashSet::new();
-        assert_eq!(rows(&g, &open, 3), vec![Row::Group { g: 0 }, Row::Group { g: 1 }, Row::Start { edits: 3 }]);
+        assert_eq!(rows(&history, &g, &open), vec![Row::Group { g: 0 }, Row::Group { g: 1 }, Row::Start { edits: 3 }]);
         open.insert(2);
         assert_eq!(
-            rows(&g, &open, 3),
+            rows(&history, &g, &open),
             vec![Row::Group { g: 0 }, Row::Group { g: 1 }, Row::Edit { ix: 1 }, Row::Edit { ix: 0 }, Row::Start { edits: 3 }]
         );
     }
@@ -809,6 +939,33 @@ mod tests {
         d.delete(0, d.len());
         assert_eq!(locate(&d.history, 1, d.len()), Some((0, 0)));
         assert_eq!(locate(&d.history, 99, d.len()), None);
+    }
+
+    #[test]
+    fn rows_offer_reverts_to_the_versions_around_them() {
+        let history = vec![edit(1, ins(0, "A")), edit(2, ins(0, "C")), edit(3, del(0, "C"))];
+        let g = groups(&history, &[save(2)]);
+        let offered = |row| reverts(row, &g, &history, 3, 0).into_iter().map(|r| (r.label, r.rev)).collect::<Vec<_>>();
+        assert_eq!(offered(Row::Group { g: 0 }), [("Discard unsaved changes", 2)]);
+        assert_eq!(offered(Row::Group { g: 1 }), [("Revert to this save", 2), ("Revert to before this save", 0)]);
+        assert_eq!(offered(Row::Edit { ix: 2 }), [("Revert to just before this change", 2)]);
+        assert_eq!(offered(Row::Edit { ix: 0 }), [("Revert to just after this change", 1), ("Revert to just before this change", 0)]);
+        assert_eq!(offered(Row::Start { edits: 3 }), [("Revert to the start of history", 0)]);
+        assert_eq!(reverts(Row::Start { edits: 0 }, &[], &[], 0, 0), vec![]);
+
+        // Discarding unsaved changes puts the saved bases back, as one undo step.
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        d.insert(0, b"ACGT");
+        d.saves.push(save(d.revision));
+        d.delete(1, 3);
+        d.insert(0, b"TT");
+        let gs = groups(&d.history, &d.saves);
+        let [discard] = reverts(Row::Group { g: 0 }, &gs, &d.history, d.revision, 0).try_into().unwrap();
+        assert!(d.revert_to(discard.rev));
+        assert_eq!(&d.seq[..], b"ACGT");
+        assert_eq!(summary(&d.history.iter().find(|e| matches!(e.op, Op::Revert { .. })).unwrap().op), "Reverted to revision 1");
+        d.undo();
+        assert_eq!(&d.seq[..], b"TTAT");
     }
 
     #[test]

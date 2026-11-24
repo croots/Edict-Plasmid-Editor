@@ -240,6 +240,18 @@ impl SeqEditor {
         cx.notify();
     }
 
+    /// Put the bases and features back as they were at revision `rev` (the History
+    /// pane), as one undo step.
+    pub fn revert_to(&mut self, rev: u64, what: &str, cx: &mut Context<Self>) {
+        let message = if self.doc.revert_to(rev) {
+            format!("Reverted to {what} · undo to put it back")
+        } else {
+            format!("Already the same as {what}")
+        };
+        let at = self.head.min(self.doc.len());
+        self.select(at, at, false, Some(message.into()), cx);
+    }
+
     fn layout(&mut self, bases_per_row: usize) -> Rc<Layout> {
         if let Some((v, bpr, l)) = &self.cached {
             if *v == self.doc.version && *bpr == bases_per_row {
@@ -1174,7 +1186,7 @@ pub(crate) fn paint_text(text: String, x: f32, y: f32, size: f32, line_h: f32, c
 
 /// The floating box behind the context menu and its submenu. Occludes, so clicks on
 /// it don't reach the sequence rows underneath.
-fn menu_panel() -> Div {
+pub(crate) fn menu_panel() -> Div {
     div()
         .occlude()
         .flex()
