@@ -1,0 +1,21 @@
+[package]
+name = "plasmid-gpui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = "0.2.2"
+gb-io = "0.9"
+anyhow = "1"
+# The bitmap type GPUI's RenderImage takes; already in the tree through gpui.
+image = { version = "0.25", default-features = false }
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only deflate: the native format never writes anything else, and we refuse other methods on read.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# gpui 0.2.2 -> zed-async-tar -> xattr 0.2.3 uses libc::ENOATTR, which current libc no
+# longer exports on Linux. ENOATTR is ENODATA there; this vendored copy changes only that.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
