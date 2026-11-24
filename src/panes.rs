@@ -15,7 +15,9 @@ use gpui::{
 };
 
 use crate::editor::{EditorEvent, SeqEditor};
+use crate::history::HistoryView;
 use crate::map::{DnaMap, MapMode};
+use crate::model::Format;
 use crate::structure_view::StructureView;
 use crate::terminal::TerminalView;
 use crate::theme;
@@ -76,6 +78,7 @@ enum PaneView {
     Map(Entity<DnaMap>),
     Structure(Entity<StructureView>),
     Terminal(Entity<TerminalView>),
+    History(Entity<HistoryView>),
 }
 
 enum Node {
@@ -193,6 +196,8 @@ enum NewPane {
     Structure(Option<String>),
     /// A shell in the document's folder.
     Terminal,
+    /// The document's edit log.
+    History,
 }
 
 /// The dropdown of the split button that was clicked.
@@ -267,6 +272,7 @@ impl PaneGroup {
                 cx.observe(&term, |_, _, cx| cx.notify()).detach();
                 PaneView::Terminal(term)
             }
+            NewPane::History => PaneView::History(cx.new(|cx| HistoryView::new(editor, cx))),
         };
         let (leaf_id, split_id) = (self.next_id, self.next_id + 1);
         self.next_id += 2;
@@ -319,8 +325,10 @@ impl PaneGroup {
                 .child(label)
                 .on_click(cx.listener(move |this, _, _, cx| this.split(leaf, axis, kind.clone(), cx)))
         };
-        let structures: Vec<(String, String)> =
-            self.editor.read(cx).doc.structures.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        let doc = &self.editor.read(cx).doc;
+        let structures: Vec<(String, String)> = doc.structures.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        // Only `.pgx` keeps the edit log, so only offer it there.
+        let has_history = doc.format == Format::Native;
         let mut list = div()
             .id("split-menu")
             .min_w(px(180.0))
@@ -338,6 +346,7 @@ impl PaneGroup {
             }))
             .child(item(("split-map", 0), "Map".into(), NewPane::Map))
             .child(item(("split-terminal", 0), "Terminal".into(), NewPane::Terminal))
+            .when(has_history, |l| l.child(item(("split-history", 0), "History".into(), NewPane::History)))
             .child(div().h(px(1.0)).my_1().bg(theme::border()));
         if structures.is_empty() {
             list = list.child(item(("split-3d", 0), "3D Structure".into(), NewPane::Structure(None)));
@@ -570,6 +579,7 @@ impl PaneGroup {
                 "" => "TERMINAL".into(),
                 title => format!("TERMINAL · {title}").into(),
             },
+            PaneView::History(_) => "HISTORY".into(),
         };
         let mut header = div()
             .id(("pane-header", id))
@@ -657,6 +667,7 @@ impl PaneGroup {
             PaneView::Map(map) => map.clone().into_any_element(),
             PaneView::Structure(s) => s.clone().into_any_element(),
             PaneView::Terminal(t) => t.clone().into_any_element(),
+            PaneView::History(h) => h.clone().into_any_element(),
         };
 
         let cell = self.leaf_bounds.clone();
@@ -721,6 +732,7 @@ impl Render for PaneGroup {
                 Some(PaneView::Sequence) => "SEQUENCE",
                 Some(PaneView::Structure(_)) => "STRUCTURE",
                 Some(PaneView::Terminal(_)) => "TERMINAL",
+                Some(PaneView::History(_)) => "HISTORY",
                 _ => "MAP",
             };
             let hint = match d.target.map(|t| t.1) {
