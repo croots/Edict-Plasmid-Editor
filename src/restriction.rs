@@ -490,8 +490,10 @@ impl RestrictionView {
     fn select_fragment(&mut self, f: &Fragment, cx: &mut Context<Self>) {
         self.editor.update(cx, |ed, cx| {
             let n = ed.doc.len();
-            if f.circular || n == 0 {
-                ed.select(0, n, false, None, cx);
+            // An uncut circle, or one cut once: the fragment is every base, and a
+            // selection from the cut round to itself would be empty.
+            if f.circular || n == 0 || f.len >= n {
+                ed.select(0, n, false, Some(format!("{} bp fragment", thousands(f.len)).into()), cx);
             } else {
                 let end = f.start + f.len;
                 ed.select(f.start, end % n, end > n, Some(format!("{} bp fragment", thousands(f.len)).into()), cx);
