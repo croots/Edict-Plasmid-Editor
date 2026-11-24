@@ -16,6 +16,7 @@ use gpui::{
 
 use crate::editor::{EditorEvent, SeqEditor};
 use crate::history::HistoryView;
+use crate::restriction::RestrictionView;
 use crate::map::{DnaMap, MapMode};
 use crate::model::Format;
 use crate::structure_view::StructureView;
@@ -79,6 +80,7 @@ enum PaneView {
     Structure(Entity<StructureView>),
     Terminal(Entity<TerminalView>),
     History(Entity<HistoryView>),
+    Restriction(Entity<RestrictionView>),
 }
 
 enum Node {
@@ -198,6 +200,8 @@ enum NewPane {
     Terminal,
     /// The document's edit log.
     History,
+    /// Restriction enzymes: cut sites and digests.
+    Restriction,
 }
 
 /// The dropdown of the split button that was clicked.
@@ -273,6 +277,7 @@ impl PaneGroup {
                 PaneView::Terminal(term)
             }
             NewPane::History => PaneView::History(cx.new(|cx| HistoryView::new(editor, cx))),
+            NewPane::Restriction => PaneView::Restriction(cx.new(|cx| RestrictionView::new(editor, cx))),
         };
         let (leaf_id, split_id) = (self.next_id, self.next_id + 1);
         self.next_id += 2;
@@ -345,6 +350,7 @@ impl PaneGroup {
                 cx.notify();
             }))
             .child(item(("split-map", 0), "Map".into(), NewPane::Map))
+            .child(item(("split-restriction", 0), "Restriction Enzymes".into(), NewPane::Restriction))
             .child(item(("split-terminal", 0), "Terminal".into(), NewPane::Terminal))
             .when(has_history, |l| l.child(item(("split-history", 0), "History".into(), NewPane::History)))
             .child(div().h(px(1.0)).my_1().bg(theme::border()));
@@ -580,6 +586,7 @@ impl PaneGroup {
                 title => format!("TERMINAL · {title}").into(),
             },
             PaneView::History(_) => "HISTORY".into(),
+            PaneView::Restriction(_) => "RESTRICTION".into(),
         };
         let mut header = div()
             .id(("pane-header", id))
@@ -668,6 +675,7 @@ impl PaneGroup {
             PaneView::Structure(s) => s.clone().into_any_element(),
             PaneView::Terminal(t) => t.clone().into_any_element(),
             PaneView::History(h) => h.clone().into_any_element(),
+            PaneView::Restriction(r) => r.clone().into_any_element(),
         };
 
         let cell = self.leaf_bounds.clone();
@@ -733,6 +741,7 @@ impl Render for PaneGroup {
                 Some(PaneView::Structure(_)) => "STRUCTURE",
                 Some(PaneView::Terminal(_)) => "TERMINAL",
                 Some(PaneView::History(_)) => "HISTORY",
+                Some(PaneView::Restriction(_)) => "RESTRICTION",
                 _ => "MAP",
             };
             let hint = match d.target.map(|t| t.1) {

@@ -103,7 +103,9 @@ impl Proj {
 }
 
 struct CircLabel {
+    /// An index into `placement.items`, or into `cut_marks` when `cut`.
     item: usize,
+    cut: bool,
     /// Label baseline center, relative to the circle's center.
     y: f32,
     right: bool,
@@ -131,7 +133,19 @@ struct Geo {
     r_out: f32,
     r_label: f32,
     circ_labels: Vec<CircLabel>,
+    /// Where the shown enzymes cut the top strand.
+    cut_marks: Vec<CutMark>,
 }
+
+struct CutMark {
+    u: f32,
+    label: String,
+    /// Linear: which row of cut labels, 0 nearest the glyphs.
+    row: usize,
+}
+
+/// Most rows of cut labels a linear map stacks; further labels overlap the top row.
+const MAX_CUT_ROWS: usize = 4;
 
 fn glyph_for(f: &Feature) -> Option<Glyph> {
     if Glyph::is_annotation(&f.kind) {
@@ -155,7 +169,7 @@ fn map_label(label: &str) -> String {
 }
 
 impl Geo {
-    fn compute(mode: MapMode, features: &[Feature], len: usize, w: f32, h: f32, label_char_w: f32) -> Geo {
+    fn compute(mode: MapMode, features: &[Feature], cuts: &[(usize, &str)], len: usize, w: f32, h: f32, label_char_w: f32) -> Geo {
         let glyphs: Vec<Option<Glyph>> = features.iter().map(glyph_for).collect();
         let labels: Vec<String> = features.iter().map(|f| map_label(&f.label)).collect();
         let lw = |i: usize| labels[i].chars().count() as f32 * label_char_w;
@@ -178,7 +192,25 @@ impl Geo {
                     let lw = |i: usize| shown[i].chars().count() as f32 * label_char_w;
                     placement = map_layout::place(features, &glyphs, len, k, None, lw, 3.0);
                 }
-                let y_base = PAD * 0.5 + placement.fwd_lanes as f32 * lane_h;
+                // Cut labels stack in rows over the glyphs, centred on their cuts.
+                let mut ends: Vec<f32> = Vec::new();
+                let mut cut_marks = Vec::with_capacity(cuts.len());
+                for &(pos, name) in cuts {
+                    let u = pos as f32 * k;
+                    let half = name.chars().count() as f32 * label_char_w / 2.0 + 3.0;
+                    let row = match ends.iter().position(|&e| e <= u - half) {
+                        Some(r) => r,
+                        None if ends.len() < MAX_CUT_ROWS => {
+                            ends.push(f32::MIN);
+                            ends.len() - 1
+                        }
+                        None => MAX_CUT_ROWS - 1,
+                    };
+                    ends[row] = u + half;
+                    cut_marks.push(CutMark { u, label: name.to_string(), row });
+                }
+                let cut_rows = ends.len();
+                let y_base = PAD * 0.5 + cut_rows as f32 * LABEL_LINE + placement.fwd_lanes as f32 * lane_h;
                 let height = y_base + placement.rev_lanes as f32 * lane_h + 40.0;
                 Geo {
                     mode,
@@ -197,6 +229,7 @@ impl Geo {
                     r_out: 0.0,
                     r_label: 0.0,
                     circ_labels: Vec::new(),
+                    cut_marks,
                 }
             }
             MapMode::Circular => {
@@ -250,6 +283,7 @@ impl Geo {
                     r_out,
                     r_label,
                     circ_labels: Vec::new(),
+                    cut_marks: cuts.iter().map(|&(pos, name)| CutMark { u: pos as f32 * k, label: name.to_string(), row: 0 }).collect(),
                 };
                 geo.circ_labels = geo.layout_circular_labels(h);
                 geo
@@ -322,36 +356,45 @@ impl Geo {
     fn layout_circular_labels(&self, h: f32) -> Vec<CircLabel> {
         let half = h / 2.0 - 12.0;
         let max_per_side = ((2.0 * half) / LABEL_LINE).floor().max(0.0) as usize;
-        let mut sides: [Vec<(usize, f32)>; 2] = [Vec::new(), Vec::new()];
-        for (i, it) in self.placement.items.iter().enumerate() {
-            if self.labels[it.feature].is_empty() {
-                continue;
-            }
-            let a = it.center() / self.r;
+        // (item, is a cut, y, priority): cut labels were asked for, so they go last.
+        let mut sides: [Vec<(usize, bool, f32, f32)>; 2] = [Vec::new(), Vec::new()];
+        let mut push = |item: usize, cut: bool, u: f32, priority: f32| {
+            let a = u / self.r;
             let right = a.rem_euclid(TAU) < std::f32::consts::PI;
-            sides[if right { 0 } else { 1 }].push((i, -self.r_label * a.cos()));
+            sides[if right { 0 } else { 1 }].push((item, cut, -self.r_label * a.cos(), priority));
+        };
+        for (i, it) in self.placement.items.iter().enumerate() {
+            if !self.labels[it.feature].is_empty() {
+                push(i, false, it.center(), it.w);
+            }
+        }
+        for (i, c) in self.cut_marks.iter().enumerate() {
+            push(i, true, c.u, f32::INFINITY);
         }
         let mut out = Vec::new();
         for (s, side) in sides.iter_mut().enumerate() {
             if side.len() > max_per_side {
-                side.sort_by(|a, b| self.placement.items[b.0].w.total_cmp(&self.placement.items[a.0].w));
+                side.sort_by(|a, b| b.3.total_cmp(&a.3));
                 side.truncate(max_per_side);
             }
-            side.sort_by(|a, b| a.1.total_cmp(&b.1));
+            side.sort_by(|a, b| a.2.total_cmp(&b.2));
             let n = side.len();
             for i in 0..n {
-                let min = if i == 0 { -half } else { side[i - 1].1 + LABEL_LINE };
-                side[i].1 = side[i].1.max(min);
+                let min = if i == 0 { -half } else { side[i - 1].2 + LABEL_LINE };
+                side[i].2 = side[i].2.max(min);
             }
             for i in (0..n).rev() {
-                let max = if i == n - 1 { half } else { side[i + 1].1 - LABEL_LINE };
-                side[i].1 = side[i].1.min(max);
+                let max = if i == n - 1 { half } else { side[i + 1].2 - LABEL_LINE };
+                side[i].2 = side[i].2.min(max);
             }
-            out.extend(side.iter().map(|&(item, y)| CircLabel { item, y, right: s == 0 }));
+            out.extend(side.iter().map(|&(item, cut, y, _)| CircLabel { item, cut, y, right: s == 0 }));
         }
         out
     }
 }
+
+/// How far a cut site's tick reaches either side of the backbone.
+const CUT_TICK: f32 = 7.0;
 
 /// Half the width of the locked band, in track units (pixels).
 const LOCK_BAND: f32 = 5.0;
@@ -494,6 +537,24 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
         }
     }
 
+    // Cut sites: a tick across the backbone; on a linear map, the enzyme's name in
+    // the rows over the glyphs (circular maps label them with the features).
+    let cut = editor::cut_colour();
+    for c in &geo.cut_marks {
+        let pts = project(proj, &[(c.u, -CUT_TICK), (c.u, CUT_TICK)], false);
+        paint_poly(window, &pts, false, Some(1.5), false, cut);
+        if let Proj::Linear { x0, .. } = *proj {
+            let v_label = v_top + (c.row + 1) as f32 * LABEL_LINE;
+            let leader = project(proj, &[(c.u, CUT_TICK), (c.u, v_label - LABEL_LINE)], false);
+            paint_poly(window, &leader, false, Some(1.0), false, cut.opacity(0.4));
+            let w = c.label.chars().count() as f32 * geo.label_char_w;
+            let (left, right) = (x0 - PAD + 2.0, x0 - PAD + geo.width - 2.0);
+            let p = proj.at(c.u, v_label);
+            let x = (f32::from(p.x) - w / 2.0).min(right - w).max(left);
+            editor::paint_text(c.label.clone(), x, f32::from(p.y), LABEL_SIZE, LABEL_LINE, cut, window, cx);
+        }
+    }
+
     if geo.mode == MapMode::Circular {
         paint_circular_labels(ctx, proj, window, cx);
         if let Proj::Circular { cx: ccx, cy, .. } = *proj {
@@ -538,13 +599,20 @@ fn paint_circular_labels(ctx: &PaintCtx, proj: &Proj, window: &mut Window, cx: &
     let Proj::Circular { cx: ccx, cy, r } = *proj else { return };
     let sel = &ctx.selection;
     for l in &geo.circ_labels {
-        let it = &geo.placement.items[l.item];
-        let label = &geo.labels[it.feature];
-        let a = it.center() / r;
-        let (_, hi) = geo.v_range(it);
-        let anchor_v = if it.reverse { hi.max(0.0) } else { hi };
-        let anchor = proj.at(it.center(), anchor_v + 1.0);
-        let elbow = proj.at(it.center(), geo.r_label - r - 2.0);
+        let (u, anchor_v, label, colour, leader_colour) = if l.cut {
+            let c = &geo.cut_marks[l.item];
+            (c.u, CUT_TICK, &c.label, editor::cut_colour(), editor::cut_colour().opacity(0.6))
+        } else {
+            let it = &geo.placement.items[l.item];
+            let (_, hi) = geo.v_range(it);
+            let anchor_v = if it.reverse { hi.max(0.0) } else { hi };
+            let selected = sel.matches_extent(it.start, it.end, geo.len);
+            let colour = if selected { theme::cursor() } else { theme::text() };
+            (it.center(), anchor_v, &geo.labels[it.feature], colour, theme::ruler())
+        };
+        let a = u / r;
+        let anchor = proj.at(u, anchor_v + 1.0);
+        let elbow = proj.at(u, geo.r_label - r - 2.0);
         let y = cy + l.y;
         let dy = l.y;
         let ring_x = if dy.abs() < geo.r_label { (geo.r_label * geo.r_label - dy * dy).sqrt() } else { 0.0 };
@@ -564,10 +632,8 @@ fn paint_circular_labels(ctx: &PaintCtx, proj: &Proj, window: &mut Window, cx: &
         let text_w = label.chars().count() as f32 * geo.label_char_w;
         let (end_x, text_x) = if l.right { (ccx + reach, ccx + reach + 3.0) } else { (ccx - reach, ccx - reach - 3.0 - text_w) };
         let leader = [anchor, elbow, point(px(end_x), px(y))];
-        paint_poly(window, &leader, false, Some(1.0), false, theme::ruler());
-        let selected = sel.matches_extent(it.start, it.end, geo.len);
-        let color = if selected { theme::cursor() } else { theme::text() };
-        editor::paint_text(label.clone(), text_x, y - LABEL_LINE / 2.0, LABEL_SIZE, LABEL_LINE, color, window, cx);
+        paint_poly(window, &leader, false, Some(1.0), false, leader_colour);
+        editor::paint_text(label.clone(), text_x, y - LABEL_LINE / 2.0, LABEL_SIZE, LABEL_LINE, colour, window, cx);
     }
 }
 
@@ -780,7 +846,11 @@ impl Render for DnaMap {
             return root;
         }
 
-        let geo = Rc::new(Geo::compute(self.mode, &features, len, w, h, label_char_w));
+        let sites = self.editor.read(cx).enzyme_sites();
+        let names = crate::enzymes::all();
+        let mut cuts: Vec<(usize, &str)> = sites.iter().flat_map(|s| s.cuts.iter().map(|c| (c.top, names[s.enzyme].name))).collect();
+        cuts.sort();
+        let geo = Rc::new(Geo::compute(self.mode, &features, &cuts, len, w, h, label_char_w));
         let mode = self.mode;
         let content_h = if mode == MapMode::Linear { geo.height.max(h) } else { h };
         let key = (mode, geo.height.round() as i32);

@@ -4,6 +4,7 @@
 //! strand, ruler, then however many feature lanes that row needs. Only visible rows
 //! are built, so a 50 kb phage scrolls as smoothly as a 3 kb plasmid.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,6 +16,7 @@ use gpui::{
     PromptLevel, SharedString, Subscription, TextRun, WeakEntity, Window,
 };
 
+use crate::enzymes::{self, Site};
 use crate::feature_dialog::{DialogEvent, FeatureDialog};
 use crate::layout::{self, Layout};
 use crate::map_layout;
@@ -70,6 +72,39 @@ pub struct SeqEditor {
     auto_links: Option<(u64, Vec<(String, Vec<usize>)>)>,
     /// Where several locks overlap and one was clicked: where, and the tasks to pick from.
     lock_chooser: Option<(Point<Pixels>, Vec<u64>)>,
+    /// Restriction enzymes whose sites the sequence and map draw: indices into
+    /// `enzymes::all()`. Set from the Restriction pane.
+    shown_enzymes: Vec<usize>,
+    /// Bumped whenever `shown_enzymes` changes; caches key on it.
+    enzymes_gen: u64,
+    /// The shown enzymes' sites, for one (document version, `enzymes_gen`).
+    enzyme_sites: RefCell<Option<(u64, u64, Rc<Vec<Site>>)>>,
+    /// Where each row's cut labels go, for one (version, `enzymes_gen`, bases per row).
+    cut_rows: Option<(u64, u64, usize, Rc<CutRows>)>,
+}
+
+/// The cut labels over each row: (site, cut within it, label lane), and how many
+/// lanes of labels the row needs above its top strand.
+pub struct CutRows {
+    labels: Vec<Vec<(usize, usize, usize)>>,
+    lanes: Vec<usize>,
+}
+
+impl CutRows {
+    fn band(&self, row: usize, lane_h: f32) -> f32 {
+        match self.lanes.get(row).copied().unwrap_or(0) {
+            0 => 0.0,
+            n => n as f32 * lane_h + 2.0,
+        }
+    }
+}
+
+/// Most label lanes a row stacks; further labels overlap the top one.
+const MAX_CUT_LANES: usize = 6;
+
+/// The colour cut sites are drawn in: the scheme's red (base16 `base08`).
+pub(crate) fn cut_colour() -> Hsla {
+    theme::terminal_palette()[1]
 }
 
 /// Things the editor asks of the panes around it.
@@ -146,6 +181,9 @@ struct Metrics {
     font_size: f32,
     lane_h: f32,
     lanes_top: f32,
+    /// Height of one lane of cut labels above the top strand, and their font size.
+    cut_lane_h: f32,
+    cut_label: f32,
 }
 
 /// Per feature, the amino acids to draw over it: (middle base of the codon, amino acid),
@@ -176,6 +214,8 @@ struct RowCtx {
     editor: WeakEntity<SeqEditor>,
     focus: FocusHandle,
     locks: Rc<Vec<Lock>>,
+    sites: Rc<Vec<Site>>,
+    cut_rows: Rc<CutRows>,
 }
 
 impl SeqEditor {
@@ -201,7 +241,106 @@ impl SeqEditor {
             translations: None,
             auto_links: None,
             lock_chooser: None,
+            shown_enzymes: Vec::new(),
+            enzymes_gen: 0,
+            enzyme_sites: RefCell::new(None),
+            cut_rows: None,
         }
+    }
+
+    /// The restriction enzymes whose sites are drawn, as indices into `enzymes::all()`.
+    pub fn shown_enzymes(&self) -> &[usize] {
+        &self.shown_enzymes
+    }
+
+    pub fn set_enzyme_shown(&mut self, ix: usize, shown: bool, cx: &mut Context<Self>) {
+        let has = self.shown_enzymes.contains(&ix);
+        if shown == has {
+            return;
+        }
+        if shown {
+            self.shown_enzymes.push(ix);
+        } else {
+            self.shown_enzymes.retain(|&i| i != ix);
+        }
+        self.enzymes_gen += 1;
+        cx.notify();
+    }
+
+    pub fn set_shown_enzymes(&mut self, shown: Vec<usize>, cx: &mut Context<Self>) {
+        if shown != self.shown_enzymes {
+            self.shown_enzymes = shown;
+            self.enzymes_gen += 1;
+            cx.notify();
+        }
+    }
+
+    /// Every site of the shown enzymes, ordered by position.
+    pub fn enzyme_sites(&self) -> Rc<Vec<Site>> {
+        let mut cache = self.enzyme_sites.borrow_mut();
+        if let Some((v, g, sites)) = cache.as_ref() {
+            if *v == self.doc.version && *g == self.enzymes_gen {
+                return sites.clone();
+            }
+        }
+        let mut sites: Vec<Site> =
+            self.shown_enzymes.iter().flat_map(|&ix| enzymes::find_sites(&self.doc.seq, self.doc.circular, ix)).collect();
+        sites.sort_by_key(|s| (s.start, s.enzyme));
+        let sites = Rc::new(sites);
+        *cache = Some((self.doc.version, self.enzymes_gen, sites.clone()));
+        sites
+    }
+
+    /// Stack each row's cut labels into lanes so none overlap. `label_cols` is how
+    /// many bases wide one character of label is.
+    fn cut_rows(&mut self, layout: &Layout, label_cols: f32) -> Rc<CutRows> {
+        let bpr = layout.bases_per_row;
+        if let Some((v, g, b, rows)) = &self.cut_rows {
+            if *v == self.doc.version && *g == self.enzymes_gen && *b == bpr && rows.lanes.len() == layout.rows {
+                return rows.clone();
+            }
+        }
+        let sites = self.enzyme_sites();
+        let all = enzymes::all();
+        let mut labels: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); layout.rows];
+        let mut lanes = vec![0; layout.rows];
+        let mut by_row: Vec<Vec<(usize, usize)>> = vec![Vec::new(); layout.rows];
+        for (si, s) in sites.iter().enumerate() {
+            for (ci, c) in s.cuts.iter().enumerate() {
+                if layout.rows > 0 {
+                    by_row[(c.top / bpr.max(1)).min(layout.rows - 1)].push((si, ci));
+                }
+            }
+        }
+        for (row, cuts) in by_row.iter_mut().enumerate() {
+            cuts.sort_by_key(|&(si, ci)| sites[si].cuts[ci].top);
+            let mut ends: Vec<f32> = Vec::new();
+            for &(si, ci) in cuts.iter() {
+                let x = sites[si].cuts[ci].top as f32;
+                let w = all[sites[si].enzyme].name.len() as f32 * label_cols + 1.5;
+                let lane = match ends.iter().position(|&e| e <= x) {
+                    Some(l) => l,
+                    None if ends.len() < MAX_CUT_LANES => {
+                        ends.push(f32::MIN);
+                        ends.len() - 1
+                    }
+                    None => MAX_CUT_LANES - 1,
+                };
+                ends[lane] = x + w;
+                labels[row].push((si, ci, lane));
+            }
+            lanes[row] = ends.len();
+        }
+        let rows = Rc::new(CutRows { labels, lanes });
+        let changed = self.cut_rows.as_ref().is_none_or(|c| c.3.lanes != rows.lanes);
+        self.cut_rows = Some((self.doc.version, self.enzymes_gen, bpr, rows.clone()));
+        if changed {
+            // Row heights changed: remeasure, keeping the same row at the top.
+            let top = self.rows.logical_scroll_top();
+            self.rows.reset(layout.rows);
+            self.rows.scroll_to(top);
+        }
+        rows
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -1220,8 +1359,12 @@ impl Render for SeqEditor {
         let layout = self.layout(bpr);
         let lane_h = (font_size * 1.25).round();
         let lanes_top = PAD_TOP + 2.0 * line_h + RULER_GAP + RULER_H;
-        let m = Metrics { char_w, line_h, font_size, lane_h, lanes_top };
+        let cut_label = (font_size * 0.8).max(8.0);
+        let cut_lane_h = (cut_label * 1.3).round();
+        let m = Metrics { char_w, line_h, font_size, lane_h, lanes_top, cut_lane_h, cut_label };
         let translations = self.translations();
+        let label_char_w: f32 = ts.advance(font_id, px(cut_label), 'A').map(|s| s.width.into()).unwrap_or(cut_label * 0.6);
+        let cut_rows = self.cut_rows(&layout, label_char_w / char_w);
 
         let ctx = RowCtx {
             seq: self.doc.seq.clone(),
@@ -1235,6 +1378,8 @@ impl Render for SeqEditor {
             editor: cx.entity().downgrade(),
             focus: self.focus.clone(),
             locks: Rc::new(self.doc.locks().to_vec()),
+            sites: self.enzyme_sites(),
+            cut_rows: cut_rows.clone(),
         };
 
         let me: Entity<Self> = cx.entity();
@@ -1262,8 +1407,8 @@ impl Render for SeqEditor {
         let mut tops = Vec::with_capacity(layout.rows + 1);
         let mut y = 0.0;
         tops.push(y);
-        for &lanes in &layout.row_lanes {
-            y += lanes_top + lanes as f32 * lane_h + ROW_GAP;
+        for (row, &lanes) in layout.row_lanes.iter().enumerate() {
+            y += cut_rows.band(row, cut_lane_h) + lanes_top + lanes as f32 * lane_h + ROW_GAP;
             tops.push(y);
         }
         let scrollbar = {
@@ -1285,7 +1430,7 @@ impl Render for SeqEditor {
         let rows = list(self.rows.clone(), move |row, _window, _cx| {
             let ctx = ctx.clone();
             let lanes = ctx.layout.row_lanes[row] as f32 * lane_h;
-            let row_h = lanes_top + lanes + ROW_GAP;
+            let row_h = ctx.cut_rows.band(row, cut_lane_h) + lanes_top + lanes + ROW_GAP;
             div()
                 .w_full()
                 .h(px(row_h))
@@ -1411,7 +1556,8 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
     let row_start = row * bpr;
     let row_end = (row_start + bpr).min(len);
     let ox: f32 = f32::from(bounds.origin.x) + PAD_X;
-    let oy: f32 = f32::from(bounds.origin.y);
+    // Cut labels, if any, sit in a band above the strands.
+    let oy: f32 = f32::from(bounds.origin.y) + ctx.cut_rows.band(row, m.cut_lane_h);
     // In f32: a codon chevron may ask for a base just before this row.
     let col = |i: usize| ox + (i as f32 - row_start as f32) * m.char_w;
     let y_top = oy + PAD_TOP;
@@ -1450,6 +1596,8 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
     if shimmering {
         window.request_animation_frame();
     }
+
+    paint_cuts(ctx, row, ox, oy, window, cx);
 
     // Cursor: a boundary position belongs to the row it starts, except the very end.
     let c = ctx.cursor;
@@ -1558,6 +1706,74 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
     register_mouse(ctx, row, bounds, hitbox, window);
 }
 
+/// The shown enzymes' sites in this row: the recognition site boxed over both
+/// strands, a vertical line through each strand where it's cut, the two joined
+/// between the strands across the sticky end, and the enzyme's name in the band
+/// above with a leader down to the top-strand cut. `oy` is the top of the strands'
+/// part of the row, below the label band.
+fn paint_cuts(ctx: &RowCtx, row: usize, ox: f32, oy: f32, window: &mut Window, cx: &mut App) {
+    if ctx.sites.is_empty() {
+        return;
+    }
+    let m = ctx.m;
+    let bpr = ctx.layout.bases_per_row;
+    let len = ctx.seq.len();
+    let row_start = row * bpr;
+    let row_end = (row_start + bpr).min(len);
+    if row_start >= row_end {
+        return;
+    }
+    let col = |i: usize| ox + (i as f32 - row_start as f32) * m.char_w;
+    let rect = |x0: f32, y0: f32, w: f32, h: f32| Bounds::new(point(px(x0), px(y0)), size(px(w), px(h)));
+    let y_top = oy + PAD_TOP;
+    let y_mid = y_top + m.line_h;
+    let c = cut_colour();
+    let in_row = |p: usize| p >= row_start && p <= row_end;
+    let all = enzymes::all();
+
+    for s in ctx.sites.iter() {
+        // Recognition site.
+        for (a, b) in enzymes::wrap_span(s.start as i64, (s.start + s.len) as i64, len) {
+            let (sa, sb) = (a.max(row_start), b.min(row_end));
+            if sa < sb {
+                let r = rect(col(sa), y_top - 1.0, (sb - sa) as f32 * m.char_w, 2.0 * m.line_h + 2.0);
+                let open = |on: bool| if on { px(1.0) } else { px(0.0) };
+                let borders = gpui::Edges { top: px(1.0), bottom: px(1.0), left: open(sa == a), right: open(sb == b) };
+                window.paint_quad(gpui::quad(r, gpui::Corners::all(px(2.0)), c.opacity(0.08), borders, c.opacity(0.45), gpui::BorderStyle::Solid));
+            }
+        }
+        for cut in &s.cuts {
+            if in_row(cut.top) {
+                window.paint_quad(fill(rect(col(cut.top) - 0.75, y_top - 2.0, 1.5, m.line_h + 2.0), c));
+            }
+            if in_row(cut.bottom) {
+                window.paint_quad(fill(rect(col(cut.bottom) - 0.75, y_mid, 1.5, m.line_h + 2.0), c));
+            }
+            // The sticky end: from one strand's cut to the other's, between the strands.
+            let (t, b) = (cut.top as i64, cut.top as i64 + cut.overhang as i64);
+            for (a, z) in enzymes::wrap_span(t.min(b), t.max(b), len) {
+                let (sa, sb) = (a.max(row_start), z.min(row_end));
+                if sa < sb {
+                    window.paint_quad(fill(rect(col(sa) - 0.75, y_mid - 0.75, (sb - sa) as f32 * m.char_w + 1.5, 1.5), c));
+                }
+            }
+        }
+    }
+
+    // Labels, stacked upwards from just over the top strand.
+    let right = ox + bpr as f32 * m.char_w;
+    for &(si, ci, lane) in ctx.cut_rows.labels.get(row).map(|l| l.as_slice()).unwrap_or(&[]) {
+        let s = &ctx.sites[si];
+        let x = col(s.cuts[ci].top);
+        let ly = oy - (lane + 1) as f32 * m.cut_lane_h;
+        window.paint_quad(fill(rect(x - 0.5, ly + m.cut_lane_h - 2.0, 1.0, y_top - (ly + m.cut_lane_h)), c.opacity(0.6)));
+        let name = all[s.enzyme].name.to_string();
+        // Keep names near the row's end inside it (estimated width; the font is monospace).
+        let lx = (x - 1.0).min(right - name.len() as f32 * m.cut_label * 0.6).max(ox - PAD_X / 2.0);
+        paint_text(name, lx, ly, m.cut_label, m.cut_lane_h, c, window, cx);
+    }
+}
+
 fn register_mouse(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window) {
     let m = ctx.m;
     let bpr = ctx.layout.bases_per_row;
@@ -1565,7 +1781,7 @@ fn register_mouse(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitb
     let row_start = row * bpr;
     let row_end = (row_start + bpr).min(len);
     let ox = f32::from(bounds.origin.x) + PAD_X;
-    let oy = f32::from(bounds.origin.y);
+    let oy = f32::from(bounds.origin.y) + ctx.cut_rows.band(row, m.cut_lane_h);
     let hit = move |x: Pixels| -> usize {
         let c = ((f32::from(x) - ox) / m.char_w).round().clamp(0.0, (row_end - row_start) as f32);
         row_start + c as usize

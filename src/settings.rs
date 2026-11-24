@@ -21,11 +21,14 @@ pub struct Settings {
     pub email: Option<String>,
     /// The BLAST dialog's last options, saved as `blast.<key> = value` lines.
     pub blast: BTreeMap<String, String>,
+    /// The Restriction pane's Favorites list, by enzyme name; None until first changed
+    /// (the pane then offers a starter set).
+    pub favorite_enzymes: Option<Vec<String>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new(), author: None, email: None, blast: BTreeMap::new() }
+        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new(), author: None, email: None, blast: BTreeMap::new(), favorite_enzymes: None }
     }
 }
 
@@ -56,6 +59,9 @@ impl Settings {
                 "custom_theme" if !value.is_empty() => s.custom_theme_paths.push(PathBuf::from(value)),
                 "author" if !value.is_empty() => s.author = Some(value.to_string()),
                 "email" if !value.is_empty() => s.email = Some(value.to_string()),
+                "favorite_enzymes" => {
+                    s.favorite_enzymes = Some(value.split(',').map(str::trim).filter(|v| !v.is_empty()).map(String::from).collect());
+                }
                 k if k.starts_with("blast.") && k.len() > "blast.".len() => {
                     s.blast.insert(k["blast.".len()..].to_string(), value.to_string());
                 }
@@ -76,6 +82,9 @@ impl Settings {
         }
         if let Some(e) = &self.email {
             out.push_str(&format!("email = {e}\n"));
+        }
+        if let Some(f) = &self.favorite_enzymes {
+            out.push_str(&format!("favorite_enzymes = {}\n", f.join(", ")));
         }
         for (k, v) in &self.blast {
             out.push_str(&format!("blast.{k} = {}\n", v.replace('\n', " ")));
@@ -139,6 +148,7 @@ mod tests {
             author: Some("Ada Lovelace".into()),
             email: Some("ada@example.org".into()),
             blast: [("program".to_string(), "blastx".to_string()), ("organism".to_string(), "Homo sapiens (taxid:9606)".to_string())].into(),
+            favorite_enzymes: Some(vec!["EcoRI".into(), "BsaI".into()]),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }

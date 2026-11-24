@@ -19,7 +19,26 @@ use crate::tasks::{self, TaskStatus};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{self, ThemeEntry, ThemeSource};
 
-actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
+actions!(plasmid, [NewFile, OpenQueued, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
+
+/// A document a pane wants opened in a new tab.
+pub struct NewDocument {
+    /// A file-name stem; the tab is untitled until saved.
+    pub stem: String,
+    pub seq: Vec<u8>,
+    pub features: Vec<crate::model::Feature>,
+    pub circular: bool,
+}
+
+thread_local! {
+    static QUEUED: std::cell::RefCell<Vec<NewDocument>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Open `doc` in a new tab, once the workspace sees the action.
+pub fn queue_new_document(doc: NewDocument, window: &mut Window, cx: &mut App) {
+    QUEUED.with(|q| q.borrow_mut().push(doc));
+    window.dispatch_action(Box::new(OpenQueued), cx);
+}
 
 /// Bindings handled by the workspace. Ctrl+S / Ctrl+Shift+S stay with the editor's
 /// own key handler; the menu shows them for discoverability.
@@ -264,16 +283,43 @@ impl Workspace {
     }
 
     fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
-        let path = loop {
-            self.untitled_count += 1;
-            let p = self.root.join(format!("untitled-{}.{}", self.untitled_count, crate::pgx::EXTENSION));
-            if !p.exists() && !self.tabs.iter().any(|t| t.path(cx) == p) {
-                break p;
-            }
-        };
+        let path = self.untitled_path("untitled", cx);
         let content = self.new_editor(Document::new_untitled(&path), cx);
         self.tabs.push(Tab { path, content });
         self.activate(self.tabs.len() - 1, window, cx);
+    }
+
+    /// A path in the folder that's neither on disk nor open: `<stem>.pgx`, or
+    /// `<stem>-2.pgx` and so on.
+    fn untitled_path(&mut self, stem: &str, cx: &App) -> PathBuf {
+        let free = |p: &Path| !p.exists() && !self.tabs.iter().any(|t| t.path(cx) == p);
+        if stem != "untitled" {
+            for i in 1.. {
+                let name = if i == 1 { format!("{stem}.{}", crate::pgx::EXTENSION) } else { format!("{stem}-{i}.{}", crate::pgx::EXTENSION) };
+                let p = self.root.join(name);
+                if free(&p) {
+                    return p;
+                }
+            }
+        }
+        loop {
+            self.untitled_count += 1;
+            let p = self.root.join(format!("untitled-{}.{}", self.untitled_count, crate::pgx::EXTENSION));
+            if free(&p) {
+                return p;
+            }
+        }
+    }
+
+    /// Open the documents [`queue_new_document`] queued, each in a new untitled tab.
+    fn open_queued(&mut self, _: &OpenQueued, window: &mut Window, cx: &mut Context<Self>) {
+        for q in QUEUED.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+            let path = self.untitled_path(&q.stem, cx);
+            let doc = Document::from_parts(&path, &q.seq, q.features, q.circular);
+            let content = self.new_editor(doc, cx);
+            self.tabs.push(Tab { path, content });
+            self.activate(self.tabs.len() - 1, window, cx);
+        }
     }
 
     fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -583,8 +629,10 @@ impl Workspace {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
-        // The BLAST dialog saves its options through the shared copy; keep them.
-        self.settings.blast = settings::shared().blast;
+        // The BLAST dialog and the Restriction pane save through the shared copy; keep them.
+        let shared = settings::shared();
+        self.settings.blast = shared.blast;
+        self.settings.favorite_enzymes = shared.favorite_enzymes;
         settings::set_shared(self.settings.clone());
         if let Err(e) = self.settings.save() {
             self.set_notice(format!("Settings not saved: {e:#}"), cx);
@@ -1382,6 +1430,7 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::new_file))
+            .on_action(cx.listener(Self::open_queued))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::save))

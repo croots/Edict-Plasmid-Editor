@@ -413,6 +413,19 @@ impl Document {
         doc
     }
 
+    /// A new untitled document holding `seq` and `features`, such as a digest
+    /// fragment. The log records them going in, but there's nothing to undo.
+    pub fn from_parts(path: &Path, seq: &[u8], features: Vec<Feature>, circular: bool) -> Self {
+        let mut doc = Self::new_untitled(path);
+        doc.circular = circular;
+        doc.insert(0, seq);
+        if !features.is_empty() {
+            doc.edit_features(Vec::new(), features);
+        }
+        doc.undo.clear();
+        doc
+    }
+
     /// Point the document at another file (Save As). The extension picks the format;
     /// saving GenBank as FASTA drops the features, which FASTA cannot hold.
     pub fn set_path(&mut self, path: &Path) -> Result<()> {
