@@ -1,63 +1,236 @@
-//! The History pane: the document's edit log, newest first, with its save points.
+//! The History pane: the document's change log, one entry per save, newest first.
 //!
-//! The log (see `pgx`) records every change to the bases, undo and redo included, each
-//! with the bases it inserted or removed. Clicking an entry selects where that change
-//! sits in today's sequence, found by carrying its position forward through every
-//! later edit. Feature changes aren't in the log, so they don't appear here.
+//! The log (see `pgx`) records every change a save keeps: bases (with the bases
+//! inserted or removed), features, attached structures and the record's name, undo
+//! and redo included, each with who made it. The pane squashes everything between two
+//! saves into one entry showing its net effect, so typing a base and deleting it again
+//! leaves nothing, and an entry expands to the individual changes. Clicking selects
+//! where a change sits in today's sequence, found by carrying its position forward
+//! through every later edit.
 
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{div, prelude::*, px, uniform_list, Context, Entity, FontWeight, SharedString, Subscription, Window};
+use gpui::{div, prelude::*, px, uniform_list, Context, Entity, FontWeight, Hsla, SharedString, Subscription, Window};
 
 use crate::editor::{editor_font, thousands, SeqEditor};
-use crate::model::{Edit, Format, Op};
-use crate::pgx::SavePoint;
+use crate::model::{Edit, FeatureRecord, Format, Op};
+use crate::pgx::{ChainLinking, SavePoint};
 use crate::theme;
 
-const ROW_H: f32 = 38.0;
+const ROW_H: f32 = 40.0;
 /// How many bases of an edit the list shows before eliding the rest.
 const PREVIEW_BASES: usize = 40;
 
-/// One line of the list.
+/// The changes that went into one save, or the ones not saved yet (`save: None`).
 #[derive(Clone, Debug, PartialEq)]
-pub enum Row {
-    /// The document as it is now: its revision, and whether that's been saved.
-    Now { rev: u64, unsaved: bool },
-    /// `history[ix]`.
-    Edit { ix: usize },
-    Save { rev: u64, time: u64, label: Option<String> },
-    /// Below the oldest edit: how far back the log goes.
-    Start { edits: usize },
+pub struct Group {
+    pub save: Option<SavePoint>,
+    /// Indices into the log.
+    pub edits: Range<usize>,
 }
 
-/// Newest first. A save point sits just above the edit it was saved at, so everything
-/// between two save lines went into the later save.
-pub fn rows(history: &[Edit], saves: &[SavePoint], revision: u64, dirty: bool) -> Vec<Row> {
-    let unsaved = unsaved(saves, revision, dirty);
-    let mut out = vec![Row::Now { rev: revision, unsaved }];
-    let mut saves: Vec<&SavePoint> = saves.iter().collect();
-    saves.sort_by_key(|s| std::cmp::Reverse((s.rev, s.time)));
-    let mut saves = saves.into_iter().peekable();
-    for (ix, e) in history.iter().enumerate().rev() {
-        while let Some(s) = saves.next_if(|s| s.rev >= e.rev) {
-            out.push(Row::Save { rev: s.rev, time: s.time, label: s.label.clone() });
-        }
-        out.push(Row::Edit { ix });
+impl Group {
+    /// Stable across rebuilds: the save's revision, or `u64::MAX` for unsaved changes.
+    fn id(&self) -> u64 {
+        self.save.as_ref().map_or(u64::MAX, |s| s.rev)
     }
-    out.extend(saves.map(|s| Row::Save { rev: s.rev, time: s.time, label: s.label.clone() }));
-    out.push(Row::Start { edits: history.len() });
+}
+
+/// Groups the log by save, newest first. A save made without new changes (saving
+/// twice, or the first save of a new file) adds no group.
+pub fn groups(history: &[Edit], saves: &[SavePoint]) -> Vec<Group> {
+    let mut saves: Vec<&SavePoint> = saves.iter().collect();
+    saves.sort_by_key(|s| (s.rev, s.time));
+    let mut out = Vec::new();
+    let mut start = 0;
+    for s in saves {
+        let end = history.partition_point(|e| e.rev <= s.rev).max(start);
+        if end > start {
+            out.push(Group { save: Some(s.clone()), edits: start..end });
+            start = end;
+        }
+    }
+    if start < history.len() {
+        out.push(Group { save: None, edits: start..history.len() });
+    }
+    out.reverse();
     out
 }
 
-fn unsaved(saves: &[SavePoint], revision: u64, dirty: bool) -> bool {
-    let last_save = saves.iter().map(|s| s.rev).max();
-    dirty || last_save.map_or(revision > 0, |r| r < revision)
+/// What a group of edits did to the bases, all told: `removed` bases at `pos` became
+/// `added` bases, in the coordinates of the group's end.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Net {
+    pub pos: usize,
+    pub removed: usize,
+    pub added: usize,
+}
+
+impl Net {
+    fn between(before: &[u8], after: &[u8]) -> Option<Net> {
+        if before == after {
+            return None;
+        }
+        let p = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+        let s = before[p..].iter().rev().zip(after[p..].iter().rev()).take_while(|(a, b)| a == b).count();
+        Some(Net { pos: p, removed: before.len() - p - s, added: after.len() - p - s })
+    }
+
+    pub fn describe(&self) -> String {
+        let span = |n: usize| format!("{}–{}", thousands(self.pos + 1), thousands(self.pos + n));
+        match (self.removed, self.added) {
+            (0, n) => format!("Inserted {} bp at {}", thousands(n), thousands(self.pos + 1)),
+            (1, 0) => format!("Deleted base {}", thousands(self.pos + 1)),
+            (n, 0) => format!("Deleted {} bp, {}", thousands(n), span(n)),
+            (r, a) => format!("Replaced {} bp at {} with {} bp", thousands(r), span(r), thousands(a)),
+        }
+    }
+}
+
+/// A group's effect: its net change to the bases, the other changes that weren't
+/// undone within it, and who made them.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Summary {
+    pub net: Option<Net>,
+    pub other: Vec<Op>,
+    pub authors: Vec<String>,
+}
+
+fn is_feature(op: &Op) -> bool {
+    matches!(op, Op::AddFeature { .. } | Op::RemoveFeature { .. } | Op::EditFeature { .. })
+}
+
+impl Summary {
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self.net.iter().map(Net::describe).collect();
+        let kinds: [(fn(&Op) -> bool, &str); 3] = [
+            (|o| matches!(o, Op::AddFeature { .. }), "added"),
+            (|o| matches!(o, Op::RemoveFeature { .. }), "removed"),
+            (|o| matches!(o, Op::EditFeature { .. }), "edited"),
+        ];
+        for (is, verb) in kinds {
+            let ops: Vec<&Op> = self.other.iter().filter(|o| is(o)).collect();
+            match ops.as_slice() {
+                [] => {}
+                [one] => parts.push(summary(one)),
+                many => parts.push(format!("{} features {verb}", many.len())),
+            }
+        }
+        parts.extend(self.other.iter().filter(|o| !is_feature(o)).map(summary));
+        if parts.is_empty() {
+            "No net change".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+/// Undo one sequence step on `seq` (other steps don't touch the bases).
+fn unapply(seq: &mut Vec<u8>, op: &Op) {
+    match op {
+        Op::Insert { pos, bases } => {
+            let a = (*pos).min(seq.len());
+            let b = (pos + bases.len()).min(seq.len());
+            seq.drain(a..b);
+        }
+        Op::Delete { pos, bases } => {
+            let a = (*pos).min(seq.len());
+            seq.splice(a..a, bases.bytes());
+        }
+        _ => {}
+    }
+}
+
+/// The non-sequence changes in `edits` that weren't reversed later within them: an
+/// undo logs the exact inverse of the step it undid, and the two cancel.
+fn surviving(edits: &[Edit]) -> Vec<Op> {
+    let mut kept: Vec<Op> = Vec::new();
+    for e in edits.iter().filter(|e| !e.op.is_sequence()) {
+        let cancels = e.op.reversal().and_then(|inv| kept.iter().rposition(|k| *k == inv));
+        match cancels {
+            Some(i) => {
+                kept.remove(i);
+            }
+            None => kept.push(e.op.clone()),
+        }
+    }
+    kept
+}
+
+/// Summaries for `groups` (newest first, as [`groups`] returns them), found by
+/// replaying the log backwards from `seq`, today's bases. A saved group never changes
+/// once written, so `memo` (keyed by its log range) spares summarizing it again, and
+/// the replay stops at the oldest group not in it.
+pub fn summarize(
+    history: &[Edit],
+    groups: &[Group],
+    seq: &[u8],
+    memo: &mut HashMap<(usize, usize), Rc<Summary>>,
+) -> Vec<Rc<Summary>> {
+    let key = |g: &Group| (g.edits.start, g.edits.end);
+    let cached = |g: &Group, memo: &HashMap<_, Rc<Summary>>| g.save.as_ref().and(memo.get(&key(g)).cloned());
+    let depth = groups.iter().rposition(|g| cached(g, memo).is_none()).map_or(0, |i| i + 1);
+    let mut cur = seq.to_vec();
+    let mut out = Vec::with_capacity(groups.len());
+    for (i, g) in groups.iter().enumerate() {
+        let edits = &history[g.edits.clone()];
+        if let Some(s) = cached(g, memo) {
+            if i < depth {
+                for e in edits.iter().rev() {
+                    unapply(&mut cur, &e.op);
+                }
+            }
+            out.push(s);
+            continue;
+        }
+        let after = cur.clone();
+        for e in edits.iter().rev() {
+            unapply(&mut cur, &e.op);
+        }
+        let mut authors: Vec<String> = Vec::new();
+        for a in edits.iter().filter_map(|e| e.author.as_ref()).chain(g.save.as_ref().and_then(|s| s.author.as_ref())) {
+            if !authors.contains(a) {
+                authors.push(a.clone());
+            }
+        }
+        let s = Rc::new(Summary { net: Net::between(&cur, &after), other: surviving(edits), authors });
+        if g.save.is_some() {
+            memo.insert(key(g), s.clone());
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// One line of the list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Row {
+    /// `groups[g]`.
+    Group { g: usize },
+    /// `history[ix]`, under its expanded group.
+    Edit { ix: usize },
+    /// Below the oldest entry: how far back the log goes.
+    Start { edits: usize },
+}
+
+pub fn rows(groups: &[Group], expanded: &HashSet<u64>, edits: usize) -> Vec<Row> {
+    let mut out = Vec::new();
+    for (g, group) in groups.iter().enumerate() {
+        out.push(Row::Group { g });
+        if expanded.contains(&group.id()) {
+            out.extend(group.edits.clone().rev().map(|ix| Row::Edit { ix }));
+        }
+    }
+    out.push(Row::Start { edits });
+    out
 }
 
 /// Carry `[s, e)` across `op` the way the document moves feature segments: an insert at
 /// or before the start shifts it, one inside it grows it, and a delete shrinks it (to
-/// an empty span where it removed all of it).
+/// an empty span where it removed all of it). Other steps leave positions alone.
 fn map_span((s, e): (usize, usize), op: &Op) -> (usize, usize) {
     match op {
         Op::Insert { pos, bases } => {
@@ -75,22 +248,41 @@ fn map_span((s, e): (usize, usize), op: &Op) -> (usize, usize) {
             let m = |x: usize| if x <= a { x } else if x >= b { x - (b - a) } else { a };
             (m(s), m(e))
         }
+        _ => (s, e),
     }
 }
 
-/// Where `history[ix]` is in the current sequence: the bases it inserted, or the gap a
-/// deletion left (an empty span). `None` if `ix` is out of range.
+/// Carry `span`, as it stood after `history[..from]`, forward to today's sequence.
+fn forward(history: &[Edit], from: usize, span: (usize, usize), len: usize) -> (usize, usize) {
+    let (s, e) = history[from.min(history.len())..].iter().fold(span, |span, later| map_span(span, &later.op));
+    (s.min(len), e.min(len))
+}
+
+/// Where `history[ix]` is in today's sequence: the bases it inserted, the gap a
+/// deletion left (an empty span), or the feature it touched. `None` if `ix` is out of
+/// range or the change has no place in the sequence (structures, renames).
 pub fn locate(history: &[Edit], ix: usize, len: usize) -> Option<(usize, usize)> {
     let edit = history.get(ix)?;
     let span = match &edit.op {
         Op::Insert { pos, bases } => (*pos, pos + bases.len()),
         Op::Delete { pos, .. } => (*pos, *pos),
+        Op::AddFeature { feature, .. } | Op::RemoveFeature { feature, .. } | Op::EditFeature { after: feature, .. } => {
+            feature.extent()?
+        }
+        _ => return None,
     };
-    let (s, e) = history[ix + 1..].iter().fold(span, |span, later| map_span(span, &later.op));
-    Some((s.min(len), e.min(len)))
+    Some(forward(history, ix + 1, span, len))
 }
 
-/// What an edit did, in a few words, with 1-based positions.
+fn quoted(f: &FeatureRecord) -> String {
+    if f.label.is_empty() {
+        f.kind.clone()
+    } else {
+        format!("“{}”", f.label)
+    }
+}
+
+/// What a change did, in a few words, with 1-based positions.
 pub fn summary(op: &Op) -> String {
     match op {
         Op::Insert { pos, bases } => format!("Inserted {} bp at {}", thousands(bases.len()), thousands(pos + 1)),
@@ -98,6 +290,75 @@ pub fn summary(op: &Op) -> String {
         Op::Delete { pos, bases } => {
             format!("Deleted {} bp, {}–{}", thousands(bases.len()), thousands(pos + 1), thousands(pos + bases.len()))
         }
+        Op::AddFeature { feature, .. } => format!("Added {} {}", feature.kind, quoted(feature)),
+        Op::RemoveFeature { feature, .. } => format!("Removed {} {}", feature.kind, quoted(feature)),
+        Op::EditFeature { before, after, .. } => {
+            if before.label != after.label {
+                format!("Renamed {} to {}", quoted(before), quoted(after))
+            } else if before.segments != after.segments {
+                format!("Moved {}", quoted(after))
+            } else if before.kind != after.kind {
+                format!("Made {} a {}", quoted(after), after.kind)
+            } else if before.strand != after.strand {
+                format!("Flipped {}", quoted(after))
+            } else {
+                format!("Edited {}", quoted(after))
+            }
+        }
+        Op::AttachStructure { name, .. } => format!("Attached structure “{name}”"),
+        Op::RemoveStructure { name, .. } => format!("Removed structure “{name}”"),
+        Op::LinkStructure { name, after, .. } => format!("Linked “{name}” by {}", linking(*after)),
+        Op::Rename { before, after } => format!("Renamed “{before}” to “{after}”"),
+    }
+}
+
+fn linking(l: ChainLinking) -> &'static str {
+    match l {
+        ChainLinking::Auto => "alignment",
+        ChainLinking::Features => "feature qualifiers",
+        ChainLinking::None => "nothing (unlinked)",
+    }
+}
+
+/// The second line of a change: its bases, or the feature's type and place.
+fn detail(op: &Op) -> String {
+    let place = |f: &FeatureRecord| {
+        let mut s = f.kind.clone();
+        if let Some((a, b)) = f.extent() {
+            s.push_str(&format!(" · {}–{}", thousands(a + 1), thousands(b)));
+        }
+        match f.strand {
+            1 => s.push_str(" · forward"),
+            -1 => s.push_str(" · reverse"),
+            _ => {}
+        }
+        s
+    };
+    match op {
+        Op::Insert { bases, .. } | Op::Delete { bases, .. } => preview(bases),
+        Op::AddFeature { feature, .. } | Op::RemoveFeature { feature, .. } => place(feature),
+        Op::EditFeature { before, after, .. } if before.segments != after.segments => {
+            format!("{} → {}", place(before), place(after))
+        }
+        Op::EditFeature { after, .. } => place(after),
+        Op::AttachStructure { format, source, bytes, .. } => {
+            let kb = bytes.div_ceil(1024);
+            let s = format!("{} · {} KB", format!("{format:?}").to_uppercase(), thousands(kb));
+            match source {
+                Some(src) => format!("{src} · {s}"),
+                None => s,
+            }
+        }
+        Op::LinkStructure { before, .. } => format!("was linked by {}", linking(*before)),
+        Op::RemoveStructure { .. } | Op::Rename { .. } => String::new(),
+    }
+}
+
+fn mark(op: &Op) -> (&'static str, Hsla) {
+    match op {
+        Op::Insert { .. } | Op::AddFeature { .. } | Op::AttachStructure { .. } => ("+", theme::accent()),
+        Op::Delete { .. } | Op::RemoveFeature { .. } | Op::RemoveStructure { .. } => ("−", theme::error()),
+        _ => ("~", theme::muted_text()),
     }
 }
 
@@ -107,6 +368,12 @@ fn preview(bases: &str) -> String {
     } else {
         format!("{}…", &bases[..PREVIEW_BASES])
     }
+}
+
+/// `s` with its first letter lower-cased, to follow a "·" mid-sentence.
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_lowercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// `time` relative to `now` (both Unix seconds): "just now", "5 min ago", "3 h ago",
@@ -145,57 +412,124 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Selected {
+    /// A group, by [`Group::id`].
+    Group(u64),
+    /// An edit, by revision.
+    Edit(u64),
+}
+
+/// What the list draws, built for one state of the document.
+struct Built {
+    /// (document version, revision, number of saves, dirty).
+    key: (u64, u64, usize, bool),
+    groups: Rc<Vec<(Group, Rc<Summary>)>>,
+    rows: Rc<Vec<Row>>,
+    history: Rc<[Edit]>,
+}
+
 pub struct HistoryView {
     editor: Entity<SeqEditor>,
-    /// The rows, a copy of the log they index, and the (document version, revision,
-    /// unsaved) they were built for.
-    cached: Option<((u64, u64, bool), Rc<Vec<Row>>, Rc<[Edit]>)>,
-    /// The revision of the entry last clicked.
-    selected: Option<u64>,
+    built: Option<Built>,
+    memo: HashMap<(usize, usize), Rc<Summary>>,
+    expanded: HashSet<u64>,
+    selected: Option<Selected>,
     _observe: Subscription,
 }
 
 impl HistoryView {
     pub fn new(editor: Entity<SeqEditor>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&editor, |_, _, cx| cx.notify());
-        Self { editor, cached: None, selected: None, _observe: observe }
+        Self { editor, built: None, memo: HashMap::new(), expanded: HashSet::new(), selected: None, _observe: observe }
     }
 
-    fn rows(&mut self, cx: &mut Context<Self>) -> (Rc<Vec<Row>>, Rc<[Edit]>) {
+    fn build(&mut self, cx: &mut Context<Self>) -> (Rc<Vec<(Group, Rc<Summary>)>>, Rc<Vec<Row>>, Rc<[Edit]>) {
         let doc = &self.editor.read(cx).doc;
-        // A save changes `dirty` and the save points without a new version.
-        let key = (doc.version, doc.revision, unsaved(&doc.saves, doc.revision, doc.dirty));
-        if let Some((k, rows, history)) = &self.cached {
-            if *k == key {
-                return (rows.clone(), history.clone());
-            }
+        // A save adds a save point without a new version.
+        let key = (doc.version, doc.revision, doc.saves.len(), doc.dirty);
+        if let Some(b) = self.built.as_ref().filter(|b| b.key == key) {
+            return (b.groups.clone(), b.rows.clone(), b.history.clone());
         }
-        let rows = Rc::new(rows(&doc.history, &doc.saves, doc.revision, doc.dirty));
+        let gs = groups(&doc.history, &doc.saves);
+        let sums = summarize(&doc.history, &gs, &doc.seq, &mut self.memo);
+        let rows = Rc::new(rows(&gs, &self.expanded, doc.history.len()));
+        let groups: Rc<Vec<_>> = Rc::new(gs.into_iter().zip(sums).collect());
         let history: Rc<[Edit]> = doc.history.clone().into();
-        self.cached = Some((key, rows.clone(), history.clone()));
-        (rows, history)
+        self.built = Some(Built { key, groups: groups.clone(), rows: rows.clone(), history: history.clone() });
+        (groups, rows, history)
+    }
+
+    fn select(&mut self, span: Option<(usize, usize)>, message: String, cx: &mut Context<Self>) {
+        if let Some((s, e)) = span {
+            self.editor.update(cx, |ed, cx| ed.select(s, e, false, Some(message.into()), cx));
+        }
+        cx.notify();
+    }
+
+    /// Expand or collapse group `g`, and select its net change to the bases (or the
+    /// first feature it touched).
+    fn open_group(&mut self, g: &Group, sum: &Summary, cx: &mut Context<Self>) {
+        let id = g.id();
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+        self.built = None;
+        self.selected = Some(Selected::Group(id));
+        let doc = &self.editor.read(cx).doc;
+        let span = match &sum.net {
+            Some(n) => Some(forward(&doc.history, g.edits.end, (n.pos, n.pos + n.added), doc.len())),
+            None => g.edits.clone().rev().filter(|&ix| sum.other.contains(&doc.history[ix].op)).find_map(|ix| locate(&doc.history, ix, doc.len())),
+        };
+        let title = match &g.save {
+            Some(s) => format!("Saved {}", when(s.time, now())),
+            None => "Unsaved changes".into(),
+        };
+        let mut message = format!("{title} · {}", lower_first(&sum.describe()));
+        if matches!(&sum.net, Some(n) if n.added > 0) && span.is_some_and(|(s, e)| s == e) {
+            message.push_str(" · those bases were removed later");
+        }
+        self.select(span, message, cx);
     }
 
     /// Select where edit `ix` is now in the sequence editor.
     fn reveal(&mut self, ix: usize, cx: &mut Context<Self>) {
         let doc = &self.editor.read(cx).doc;
         let Some(edit) = doc.history.get(ix) else { return };
-        let Some((s, e)) = locate(&doc.history, ix, doc.len()) else { return };
-        let mut message = format!("Revision {} · {}", edit.rev, summary(&edit.op).to_lowercase());
-        if matches!(edit.op, Op::Insert { .. }) && s == e {
+        let span = locate(&doc.history, ix, doc.len());
+        let mut message = format!("Revision {} · {}", edit.rev, lower_first(&summary(&edit.op)));
+        if matches!(edit.op, Op::Insert { .. }) && span.is_some_and(|(s, e)| s == e) {
             message.push_str(" · those bases were removed later");
         }
-        self.selected = Some(edit.rev);
-        self.editor.update(cx, |ed, cx| ed.select(s, e, false, Some(message.into()), cx));
-        cx.notify();
+        self.selected = Some(Selected::Edit(edit.rev));
+        self.select(span, message, cx);
     }
+}
+
+fn two_lines(title: impl IntoElement, meta: String, second: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .text_sm()
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(title))
+                .child(div().flex_shrink_0().text_xs().text_color(theme::muted_text()).child(meta)),
+        )
+        .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().text_xs().text_color(theme::muted_text()).child(second))
 }
 
 impl Render for HistoryView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (rows, history) = self.rows(cx);
+        let (groups, rows, history) = self.build(cx);
         let format = self.editor.read(cx).doc.format;
         let selected = self.selected;
+        let expanded = self.expanded.clone();
         let now = now();
 
         let notice = (format != Format::Native).then(|| {
@@ -207,7 +541,7 @@ impl Render for HistoryView {
                 .text_xs()
                 .text_color(theme::muted_text())
                 .child(format!(
-                    "{} files don't keep edit history: these edits are lost when this file is saved. Save As .pgx to keep them.",
+                    "{} files don't keep a change history: these changes are lost when this file is saved. Save As .pgx to keep them.",
                     format.name()
                 ))
         });
@@ -219,43 +553,58 @@ impl Render for HistoryView {
                 range
                     .map(|i| {
                         let base = div().id(("history-row", i)).h(px(ROW_H)).px_3().flex().flex_row().items_center().gap_2();
-                        match &rows[i] {
-                            Row::Now { rev, unsaved } => base
-                                .border_b_1()
-                                .border_color(theme::border())
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Now"))
-                                .child(div().text_xs().text_color(theme::muted_text()).child(format!("revision {rev}")))
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(if *unsaved { theme::accent() } else { theme::muted_text() })
-                                        .child(if *unsaved { "unsaved changes" } else { "saved" }),
-                                ),
-                            Row::Save { rev, time, label } => {
-                                let title: SharedString = match label {
-                                    Some(l) => format!("Saved · {l}").into(),
-                                    None => "Saved".into(),
+                        match rows[i] {
+                            Row::Group { g } => {
+                                let (group, sum) = &groups[g];
+                                let open = expanded.contains(&group.id());
+                                let is_selected = selected == Some(Selected::Group(group.id()));
+                                let n = group.edits.len();
+                                let (title, color, time): (SharedString, Hsla, u64) = match &group.save {
+                                    Some(s) => (
+                                        s.label.as_ref().map_or("Saved".into(), |l| format!("Saved · {l}").into()),
+                                        theme::text(),
+                                        s.time,
+                                    ),
+                                    None => ("Unsaved changes".into(), theme::accent(), history[group.edits.end - 1].time),
                                 };
-                                base.child(div().w(px(14.0)).flex().justify_center().text_color(theme::accent()).child("●"))
-                                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme::accent()).child(title))
-                                    .child(div().h(px(1.0)).flex_1().bg(theme::border()))
+                                let meta = format!("{} change{} · {}", thousands(n), if n == 1 { "" } else { "s" }, when(time, now));
+                                let mut second = sum.describe();
+                                if !sum.authors.is_empty() {
+                                    second = format!("{} · {second}", sum.authors.join(", "));
+                                }
+                                let (group, sum) = (group.clone(), sum.clone());
+                                base.cursor_pointer()
+                                    .border_b_1()
+                                    .border_color(theme::border())
+                                    .when(is_selected, |d| d.bg(theme::active()))
+                                    .hover(|s| s.bg(theme::hover()))
                                     .child(
                                         div()
+                                            .w(px(14.0))
+                                            .flex()
+                                            .justify_center()
                                             .text_xs()
                                             .text_color(theme::muted_text())
-                                            .child(format!("rev {rev} · {}", when(*time, now))),
+                                            .child(if open { "▾" } else { "▸" }),
                                     )
+                                    .child(two_lines(
+                                        div().font_weight(FontWeight::SEMIBOLD).text_color(color).child(title),
+                                        meta,
+                                        second,
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.open_group(&group, &sum, cx)))
                             }
                             Row::Edit { ix } => {
-                                let ix = *ix;
                                 let e = &history[ix];
-                                let (sign, color, bases) = match &e.op {
-                                    Op::Insert { bases, .. } => ("+", theme::accent(), bases),
-                                    Op::Delete { bases, .. } => ("−", theme::error(), bases),
-                                };
-                                let is_selected = selected == Some(e.rev);
-                                base.cursor_pointer()
+                                let (sign, color) = mark(&e.op);
+                                let is_selected = selected == Some(Selected::Edit(e.rev));
+                                let mut meta = format!("rev {}", e.rev);
+                                if let Some(a) = &e.author {
+                                    meta.push_str(&format!(" · {a}"));
+                                }
+                                meta.push_str(&format!(" · {}", when(e.time, now)));
+                                base.pl(px(26.0))
+                                    .cursor_pointer()
                                     .when(is_selected, |d| d.bg(theme::active()))
                                     .hover(|s| s.bg(theme::hover()))
                                     .child(
@@ -267,58 +616,19 @@ impl Render for HistoryView {
                                             .text_color(color)
                                             .child(sign),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .gap_2()
-                                                    .text_sm()
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .when(is_selected, |d| d.text_color(theme::accent()))
-                                                            .child(summary(&e.op)),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .flex_shrink_0()
-                                                            .text_xs()
-                                                            .text_color(theme::muted_text())
-                                                            .child(format!("rev {} · {}", e.rev, when(e.time, now))),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .font(editor_font())
-                                                    .text_xs()
-                                                    .text_color(theme::muted_text())
-                                                    .child(preview(bases)),
-                                            ),
-                                    )
+                                    .child(two_lines(
+                                        div().when(is_selected, |d| d.text_color(theme::accent())).child(summary(&e.op)),
+                                        meta,
+                                        div().when(e.op.is_sequence(), |d| d.font(editor_font())).child(detail(&e.op)),
+                                    ))
                                     .on_click(cx.listener(move |this, _, _, cx| this.reveal(ix, cx)))
                             }
                             Row::Start { edits } => base.justify_center().text_xs().text_color(theme::muted_text()).child(
-                                if *edits == 0 {
-                                    "No sequence edits yet. Changes to the bases will be listed here.".to_string()
+                                if edits == 0 {
+                                    "No changes yet. Edits to the bases, features and structures will be listed here."
+                                        .to_string()
                                 } else {
-                                    format!(
-                                        "Start of history · {} edit{} · feature changes aren't recorded",
-                                        thousands(*edits),
-                                        if *edits == 1 { "" } else { "s" }
-                                    )
+                                    format!("Start of history · {} change{}", thousands(edits), if edits == 1 { "" } else { "s" })
                                 },
                             ),
                         }
@@ -342,10 +652,11 @@ impl Render for HistoryView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Document;
+    use crate::model::{Document, Feature};
+    use std::path::Path;
 
     fn edit(rev: u64, op: Op) -> Edit {
-        Edit { rev, time: 0, op }
+        Edit { rev, time: 0, author: None, op }
     }
 
     fn ins(pos: usize, b: &str) -> Op {
@@ -356,32 +667,128 @@ mod tests {
         Op::Delete { pos, bases: b.into() }
     }
 
+    fn save(rev: u64) -> SavePoint {
+        SavePoint { rev, time: rev * 10, author: None, label: None }
+    }
+
+    fn feature(label: &str, s: usize, e: usize) -> Feature {
+        Feature { kind: "CDS".into(), label: label.into(), segments: vec![(s, e)], strand: 1, source: None }
+    }
+
+    /// Summaries for the whole document, oldest group last.
+    fn summaries(d: &Document) -> Vec<Rc<Summary>> {
+        summarize(&d.history, &groups(&d.history, &d.saves), &d.seq, &mut HashMap::new())
+    }
+
     #[test]
-    fn rows_put_save_points_above_the_edit_they_saved() {
+    fn groups_split_the_log_at_saves() {
         let history = vec![edit(1, ins(0, "A")), edit(2, ins(0, "C")), edit(3, del(0, "C"))];
-        let saves = vec![SavePoint { rev: 2, time: 5, label: None }, SavePoint { rev: 0, time: 1, label: None }];
-        let r = rows(&history, &saves, 3, true);
+        // Saves at 0 and twice at 2 add nothing of their own.
+        let saves = vec![save(2), save(0), save(2)];
+        let g = groups(&history, &saves);
+        assert_eq!(g, vec![Group { save: None, edits: 2..3 }, Group { save: Some(save(2)), edits: 0..2 }]);
+        assert_eq!(groups(&history, &[save(3)]), vec![Group { save: Some(save(3)), edits: 0..3 }]);
+        assert_eq!(groups(&[], &[save(0)]), vec![]);
+
+        let mut open = HashSet::new();
+        assert_eq!(rows(&g, &open, 3), vec![Row::Group { g: 0 }, Row::Group { g: 1 }, Row::Start { edits: 3 }]);
+        open.insert(2);
         assert_eq!(
-            r,
-            vec![
-                Row::Now { rev: 3, unsaved: true },
-                Row::Edit { ix: 2 },
-                Row::Save { rev: 2, time: 5, label: None },
-                Row::Edit { ix: 1 },
-                Row::Edit { ix: 0 },
-                Row::Save { rev: 0, time: 1, label: None },
-                Row::Start { edits: 3 },
-            ]
+            rows(&g, &open, 3),
+            vec![Row::Group { g: 0 }, Row::Group { g: 1 }, Row::Edit { ix: 1 }, Row::Edit { ix: 0 }, Row::Start { edits: 3 }]
         );
-        let saved = vec![SavePoint { rev: 3, time: 9, label: None }];
-        assert_eq!(rows(&history, &saved, 3, false)[0], Row::Now { rev: 3, unsaved: false });
-        assert_eq!(rows(&[], &[], 0, false), vec![Row::Now { rev: 0, unsaved: false }, Row::Start { edits: 0 }]);
+    }
+
+    #[test]
+    fn a_save_shows_its_net_change() {
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        d.insert(0, b"AAAACCCC");
+        d.saves.push(SavePoint { rev: d.revision, time: 1, author: None, label: None });
+        // Type three bases, delete one of them again, and undo a stray deletion.
+        d.insert(4, b"GGG");
+        d.delete(5, 6);
+        d.delete(0, 1);
+        d.undo();
+        let s = summaries(&d);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].net, Some(Net { pos: 4, removed: 0, added: 2 }));
+        assert_eq!(s[0].describe(), "Inserted 2 bp at 5");
+        assert_eq!(s[1].describe(), "Inserted 8 bp at 1");
+
+        // Typing and deleting the same bases leaves nothing.
+        d.saves.push(SavePoint { rev: d.revision, time: 2, author: None, label: None });
+        d.insert(2, b"T");
+        d.delete(2, 3);
+        assert_eq!(summaries(&d)[0].describe(), "No net change");
+
+        assert_eq!(Net { pos: 9, removed: 3, added: 5 }.describe(), "Replaced 3 bp at 10–12 with 5 bp");
+        assert_eq!(Net { pos: 0, removed: 1, added: 0 }.describe(), "Deleted base 1");
+    }
+
+    #[test]
+    fn memoized_saves_match_a_fresh_replay() {
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut memo = HashMap::new();
+        for round in 0..4u8 {
+            d.insert(0, &[b'A' + round; 3]);
+            d.delete(1, 2);
+            d.saves.push(SavePoint { rev: d.revision, time: round.into(), author: None, label: None });
+            d.insert(d.len(), b"T");
+            let g = groups(&d.history, &d.saves);
+            assert_eq!(summarize(&d.history, &g, &d.seq, &mut memo), summaries(&d));
+            d.saves.push(SavePoint { rev: d.revision, time: 9, author: None, label: None });
+        }
+        assert!(!memo.is_empty());
+    }
+
+    #[test]
+    fn feature_and_structure_changes_are_logged_and_undo_cancels_them() {
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        d.insert(0, b"ACGTACGTACGT");
+        d.saves.push(SavePoint { rev: d.revision, time: 1, author: None, label: None });
+        d.add_feature(feature("lacZ", 2, 8));
+        d.add_feature(feature("oops", 0, 3));
+        d.undo();
+        let mut moved = feature("lacZ", 4, 10);
+        moved.strand = -1;
+        d.replace_feature(0, moved);
+        d.set_structure_linking("none", ChainLinking::None);
+
+        let s = summaries(&d);
+        assert_eq!(s[0].other.len(), 2, "{:?}", s[0].other);
+        assert_eq!(s[0].describe(), "Added CDS “lacZ” · Moved “lacZ”");
+        assert!(matches!(d.history.last().map(|e| &e.op), Some(Op::EditFeature { .. })));
+        let last = d.history.len() - 1;
+        assert_eq!(locate(&d.history, last, d.len()), Some((4, 10)));
+        assert_eq!(detail(&d.history[last].op), "CDS · 3–8 · forward → CDS · 5–10 · reverse");
+
+        d.insert(0, b"GG");
+        assert_eq!(locate(&d.history, last, d.len()), Some((6, 12)), "followed through later inserts");
+
+        d.remove_feature(0);
+        d.undo();
+        assert_eq!(summaries(&d)[0].other.len(), 2, "remove + undo cancel");
+    }
+
+    #[test]
+    fn authors_are_recorded_and_listed_once() {
+        crate::model::set_author(Some("  ada ".into()));
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        d.insert(0, b"ACGT");
+        d.delete(0, 1);
+        crate::model::set_author(Some("grace".into()));
+        d.insert(0, b"T");
+        assert_eq!(d.history[0].author.as_deref(), Some("ada"));
+        assert_eq!(summaries(&d)[0].authors, vec!["ada".to_string(), "grace".to_string()]);
+        crate::model::set_author(None);
+        d.insert(0, b"T");
+        assert_eq!(d.history.last().unwrap().author, None);
     }
 
     /// Replaying the log for real and comparing against `locate` keeps the two honest.
     #[test]
     fn locate_follows_an_edit_through_later_ones() {
-        let mut d = Document::new_untitled(std::path::Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
         d.insert(0, b"AAAAAAAAAA");
         d.insert(4, b"GGG"); // AAAAGGGAAAAAA, ix 1
         d.insert(0, b"TT"); // shifts it right by 2
@@ -406,14 +813,14 @@ mod tests {
 
     #[test]
     fn undo_appears_as_its_own_edit() {
-        let mut d = Document::new_untitled(std::path::Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.pgx"));
         d.insert(0, b"ACGT");
         d.undo();
-        let r = rows(&d.history, &d.saves, d.revision, d.dirty);
-        assert_eq!(r.len(), 4);
+        assert_eq!(d.history.len(), 2);
         assert_eq!(summary(&d.history[1].op), "Deleted 4 bp, 1–4");
         assert_eq!(summary(&d.history[0].op), "Inserted 4 bp at 1");
         assert_eq!(summary(&del(1233, "A")), "Deleted base 1,234");
+        assert_eq!(lower_first("Inserted"), "inserted");
     }
 
     #[test]

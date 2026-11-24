@@ -140,6 +140,7 @@ impl Workspace {
             theme_scroll: UniformListScrollHandle::new(),
             notice: None,
         };
+        crate::model::set_author(ws.settings.effective_author());
         ws.reload_themes();
         if let Some(entry) = ws.themes.iter().find(|t| t.id == ws.settings.theme) {
             theme::set(entry.theme());

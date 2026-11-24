@@ -13,11 +13,13 @@ pub struct Settings {
     pub theme: String,
     /// base16 scheme files, or folders of them, added in Settings.
     pub custom_theme_paths: Vec<PathBuf>,
+    /// The name the edit history records changes under; the account's name if unset.
+    pub author: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new() }
+        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new(), author: None }
     }
 }
 
@@ -46,6 +48,7 @@ impl Settings {
             match key.trim() {
                 "theme" if !value.is_empty() => s.theme = value.to_string(),
                 "custom_theme" if !value.is_empty() => s.custom_theme_paths.push(PathBuf::from(value)),
+                "author" if !value.is_empty() => s.author = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -58,7 +61,17 @@ impl Settings {
         for p in &self.custom_theme_paths {
             out.push_str(&format!("custom_theme = {}\n", p.display()));
         }
+        if let Some(a) = &self.author {
+            out.push_str(&format!("author = {a}\n"));
+        }
         out
+    }
+
+    /// Who the edit history credits: the `author` setting, else the login name.
+    pub fn effective_author(&self) -> Option<String> {
+        self.author.clone().or_else(|| {
+            ["USER", "USERNAME", "LOGNAME"].iter().find_map(|k| std::env::var(k).ok()).filter(|n| !n.trim().is_empty())
+        })
     }
 
     pub fn save(&self) -> Result<()> {
@@ -83,6 +96,7 @@ mod tests {
         let s = Settings {
             theme: "file:/home/me/themes/my theme.yaml".into(),
             custom_theme_paths: vec!["/home/me/themes".into(), "/tmp/one.yaml".into()],
+            author: Some("Ada Lovelace".into()),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }

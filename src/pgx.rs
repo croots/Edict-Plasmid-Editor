@@ -6,8 +6,8 @@
 //! manifest.json          format name + version, app version, current revision
 //! sequence.json          source of truth: sequence, topology, features, record metadata
 //! sequence.gb            GenBank copy for other tools; regenerated on save, never read
-//! history/ops.jsonl      one edit per line, oldest first: {rev, time, op, pos, bases}
-//! history/revisions.json save points: [{rev, time, label?}]
+//! history/ops.jsonl      one change per line, oldest first: {rev, time, author?, op, …}
+//! history/revisions.json save points: [{rev, time, author?, label?}]
 //! structures/index.json  attached 3D structures: [{id, name, file, format, source?}]
 //! structures/<id>.pdb    each structure's file, byte-for-byte as attached (.pdb or .cif)
 //! alignments/…           reserved; see below
@@ -18,8 +18,10 @@
 //!   refuses files with a newer version rather than guess.
 //! - Entries a reader doesn't know are kept byte-for-byte and written back on save, so
 //!   an older build never strips data a newer one added.
-//! - Every edit stores the bases it inserted or removed, so the log can be replayed
-//!   backwards from `sequence.json` to any earlier revision without checkpoints.
+//! - The log records every change a save keeps (bases, features, structures, the
+//!   record name), and each sequence step stores the bases it inserted or removed, so
+//!   the log can be replayed backwards from `sequence.json` to any earlier revision
+//!   without checkpoints.
 //! - Anything tied to coordinates (alignments, when they arrive) records the `revision`
 //!   it was made against; if that differs from the manifest's, it is stale.
 //! - Structures are stored without any tie to coordinates: which CDS a chain belongs
@@ -41,7 +43,8 @@ use crate::model::{self, Edit};
 pub const EXTENSION: &str = "pgx";
 pub const MIME_TYPE: &str = "application/vnd.plasmid-gpui+zip";
 pub const FORMAT_NAME: &str = "plasmid-gpui";
-pub const FORMAT_VERSION: u32 = 1;
+/// 2: the log records feature, structure and name changes too, and who made each one.
+pub const FORMAT_VERSION: u32 = 2;
 
 const MAX_ENTRY_BYTES: u64 = 256 << 20;
 const MAX_TOTAL_BYTES: u64 = 1 << 30;
@@ -147,6 +150,8 @@ pub fn structure_id(stem: &str, taken: &[Structure]) -> String {
 pub struct SavePoint {
     pub rev: u64,
     pub time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -491,8 +496,8 @@ fn from_json(s: SequenceFile) -> Seq {
     r.topology = if s.topology == "circular" { Topology::Circular } else { Topology::Linear };
     r.molecule_type = s.molecule_type.or(Some("DNA".into()));
     r.seq = s.sequence.into_bytes();
+    // Case is kept: lower-case bases are a common way to mark a region.
     r.seq.retain(|b| b.is_ascii_alphabetic());
-    r.seq.make_ascii_uppercase();
     r.len = Some(r.seq.len());
     let len = r.seq.len();
     r.features = s
@@ -554,10 +559,10 @@ mod tests {
         let mut record = sample();
         record.seq.make_ascii_uppercase();
         let history = vec![
-            Edit { rev: 1, time: 10, op: Op::Insert { pos: 3, bases: "GG".into() } },
-            Edit { rev: 2, time: 11, op: Op::Delete { pos: 0, bases: "T".into() } },
+            Edit { rev: 1, time: 10, author: None, op: Op::Insert { pos: 3, bases: "GG".into() } },
+            Edit { rev: 2, time: 11, author: None, op: Op::Delete { pos: 0, bases: "T".into() } },
         ];
-        let saves = vec![SavePoint { rev: 2, time: 12, label: None }];
+        let saves = vec![SavePoint { rev: 2, time: 12, author: None, label: None }];
         let extras = vec![("alignments/a1.json".to_string(), b"{\"revision\":1}".to_vec())];
         let structures = vec![Structure {
             id: "2y0g".into(),

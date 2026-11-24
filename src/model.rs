@@ -102,21 +102,100 @@ impl Format {
     }
 }
 
-/// One step of the persistent edit log. Both variants carry the bases involved, so
-/// the log can be undone backwards from the current sequence without checkpoints.
+/// A feature as the edit log records it: everything a save keeps of it, in the
+/// coordinates of the revision it was logged at.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase")]
+pub struct FeatureRecord {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub label: String,
+    /// +1 forward, -1 reverse, 0 none.
+    #[serde(default)]
+    pub strand: i8,
+    /// Half-open, 0-based `[start, end)` pairs in order.
+    pub segments: Vec<[usize; 2]>,
+    /// GenBank qualifiers in file order; `null` for valueless ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualifiers: Vec<(String, Option<String>)>,
+}
+
+impl FeatureRecord {
+    pub fn of(f: &Feature) -> Self {
+        FeatureRecord {
+            kind: f.kind.clone(),
+            label: f.label.clone(),
+            strand: f.strand,
+            segments: f.segments.iter().map(|&(s, e)| [s, e]).collect(),
+            qualifiers: to_gb_feature(f).qualifiers.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
+
+    /// The span from its first base to its last.
+    pub fn extent(&self) -> Option<(usize, usize)> {
+        let s = self.segments.iter().map(|g| g[0]).min()?;
+        let e = self.segments.iter().map(|g| g[1]).max()?;
+        Some((s, e))
+    }
+}
+
+/// One step of the persistent edit log: every change a save keeps. Sequence steps
+/// carry the bases involved, so the log can be undone backwards from the current
+/// sequence without checkpoints, and feature steps carry the feature before and after.
+///
+/// Changes a sequence edit makes to features (shifting them, growing or trimming
+/// them, dropping ones whose bases are all deleted) follow from that edit and aren't
+/// logged separately.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     Insert { pos: usize, bases: String },
     Delete { pos: usize, bases: String },
+    /// Feature `ix` was added (it is the `ix`th feature afterwards).
+    AddFeature { ix: usize, feature: FeatureRecord },
+    /// Feature `ix` was removed.
+    RemoveFeature { ix: usize, feature: FeatureRecord },
+    EditFeature { ix: usize, before: FeatureRecord, after: FeatureRecord },
+    /// A 3D structure was attached. Its file is kept with the document, not in the log.
+    AttachStructure {
+        id: String,
+        name: String,
+        format: pgx::StructureFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        bytes: usize,
+    },
+    RemoveStructure { id: String, name: String },
+    LinkStructure { id: String, name: String, before: pgx::ChainLinking, after: pgx::ChainLinking },
+    /// The record took a new name (Save As).
+    Rename { before: String, after: String },
 }
 
 impl Op {
-    fn inverse(&self) -> Op {
-        match self {
+    /// Inserts and deletes: the steps that change the bases.
+    pub fn is_sequence(&self) -> bool {
+        matches!(self, Op::Insert { .. } | Op::Delete { .. })
+    }
+
+    /// The step that exactly reverses this one, if a single step can: attaching and
+    /// removing a structure can't, since the log doesn't hold structure files.
+    pub fn reversal(&self) -> Option<Op> {
+        Some(match self {
             Op::Insert { pos, bases } => Op::Delete { pos: *pos, bases: bases.clone() },
             Op::Delete { pos, bases } => Op::Insert { pos: *pos, bases: bases.clone() },
-        }
+            Op::AddFeature { ix, feature } => Op::RemoveFeature { ix: *ix, feature: feature.clone() },
+            Op::RemoveFeature { ix, feature } => Op::AddFeature { ix: *ix, feature: feature.clone() },
+            Op::EditFeature { ix, before, after } => Op::EditFeature { ix: *ix, before: after.clone(), after: before.clone() },
+            Op::LinkStructure { id, name, before, after } => {
+                Op::LinkStructure { id: id.clone(), name: name.clone(), before: *after, after: *before }
+            }
+            Op::Rename { before, after } => Op::Rename { before: after.clone(), after: before.clone() },
+            Op::AttachStructure { .. } | Op::RemoveStructure { .. } => return None,
+        })
+    }
+
+    /// Undo steps only hold sequence and feature changes, which always reverse.
+    fn inverse(&self) -> Op {
+        self.reversal().unwrap_or_else(|| self.clone())
     }
 }
 
@@ -126,8 +205,24 @@ pub struct Edit {
     pub rev: u64,
     /// Unix seconds.
     pub time: u64,
+    /// Who made it: the `author` setting, or the account's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(flatten)]
     pub op: Op,
+}
+
+thread_local! {
+    static AUTHOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Name the person whose edits and saves are logged from now on.
+pub fn set_author(name: Option<String>) {
+    AUTHOR.with(|a| *a.borrow_mut() = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()));
+}
+
+pub fn author() -> Option<String> {
+    AUTHOR.with(|a| a.borrow().clone())
 }
 
 #[derive(Clone)]
@@ -234,9 +329,13 @@ impl Document {
         }
     }
 
+    /// A `.pgx` keeps its bases' case exactly (its log depends on it); other formats
+    /// go through [`conventional_case`].
     fn from_record(path: &Path, mut record: Seq, format: Format) -> Self {
+        if format != Format::Native {
+            record.seq = conventional_case(std::mem::take(&mut record.seq));
+        }
         let len = record.seq.len();
-        record.seq.make_ascii_uppercase();
         let mut features: Vec<Feature> = record
             .features
             .iter()
@@ -264,10 +363,10 @@ impl Document {
                 seen_header = true;
                 continue;
             }
-            seq.extend(line.bytes().filter(|b| b.is_ascii_alphabetic()).map(|b| b.to_ascii_uppercase()));
+            seq.extend(line.bytes().filter(|b| b.is_ascii_alphabetic()));
         }
         let mut doc = Self::blank(path, Format::Fasta);
-        doc.seq = Rc::new(seq);
+        doc.seq = Rc::new(conventional_case(seq));
         Ok(doc)
     }
 
@@ -289,7 +388,14 @@ impl Document {
         }
         self.format = format;
         self.path = path.to_path_buf();
-        self.name = file_stem(path);
+        let name = file_stem(path);
+        if self.untitled {
+            self.name = name;
+        } else if name != self.name {
+            // The record is saved under the new name, so the log says so.
+            let before = std::mem::replace(&mut self.name, name.clone());
+            self.log(Op::Rename { before, after: name });
+        }
         self.untitled = false;
         if let Some(record) = &mut self.record {
             record.name = Some(locus_name(&self.name));
@@ -307,7 +413,14 @@ impl Document {
 
     fn log(&mut self, op: Op) {
         self.revision += 1;
-        self.history.push(Edit { rev: self.revision, time: now(), op });
+        self.history.push(Edit { rev: self.revision, time: now(), author: author(), op });
+    }
+
+    /// Log a change that isn't an undo step (structures, linking).
+    fn changed_for_good(&mut self, op: Op) {
+        self.log(op);
+        self.version += 1;
+        self.dirty = true;
     }
 
     fn changed(&mut self, before: Snapshot, ops: Vec<Op>) {
@@ -431,52 +544,57 @@ impl Document {
         }
     }
 
-    /// Add a feature as one undo step. Features aren't in the edit log (it records
-    /// sequence changes only), but they are saved with the document.
+    /// Add a feature as one undo step.
     pub fn add_feature(&mut self, feature: Feature) {
         if feature.segments.is_empty() {
             return;
         }
         let feature = self.encoded(feature);
         let before = self.snapshot();
+        let op = Op::AddFeature { ix: self.features.len(), feature: FeatureRecord::of(&feature) };
         Rc::make_mut(&mut self.features).push(feature);
-        self.changed(before, Vec::new());
+        self.changed(before, vec![op]);
     }
 
     /// Replace feature `ix` (Edit Feature) as one undo step.
     pub fn replace_feature(&mut self, ix: usize, feature: Feature) {
-        if ix >= self.features.len() || feature.segments.is_empty() {
-            return;
-        }
-        let feature = self.encoded(feature);
-        let before = self.snapshot();
-        Rc::make_mut(&mut self.features)[ix] = feature;
-        self.changed(before, Vec::new());
+        self.edit_features(vec![(ix, feature)], Vec::new());
     }
 
     /// Replace some features and add others, as one undo step.
     pub fn edit_features(&mut self, replace: Vec<(usize, Feature)>, add: Vec<Feature>) {
-        let replace: Vec<_> = replace.into_iter().filter(|(ix, f)| *ix < self.features.len() && !f.segments.is_empty()).collect();
+        let replace: Vec<_> = replace
+            .into_iter()
+            .filter(|(ix, f)| *ix < self.features.len() && !f.segments.is_empty())
+            .map(|(ix, f)| (ix, self.encoded(f)))
+            .collect();
         let add: Vec<_> = add.into_iter().filter(|f| !f.segments.is_empty()).map(|f| self.encoded(f)).collect();
         if replace.is_empty() && add.is_empty() {
             return;
         }
         let before = self.snapshot();
+        let mut ops = Vec::new();
         let features = Rc::make_mut(&mut self.features);
         for (ix, f) in replace {
+            let (was, now) = (FeatureRecord::of(&features[ix]), FeatureRecord::of(&f));
+            if was != now {
+                ops.push(Op::EditFeature { ix, before: was, after: now });
+            }
             features[ix] = f;
         }
-        features.extend(add);
-        self.changed(before, Vec::new());
+        for f in add {
+            ops.push(Op::AddFeature { ix: features.len(), feature: FeatureRecord::of(&f) });
+            features.push(f);
+        }
+        self.changed(before, ops);
     }
 
     /// Change how structure `id` links its chains. Not an undo step.
     pub fn set_structure_linking(&mut self, id: &str, linking: pgx::ChainLinking) {
-        if let Some(s) = self.structures.iter_mut().find(|s| s.id == id && s.linking != linking) {
-            s.linking = linking;
-            self.version += 1;
-            self.dirty = true;
-        }
+        let Some(s) = self.structures.iter_mut().find(|s| s.id == id && s.linking != linking) else { return };
+        let op = Op::LinkStructure { id: s.id.clone(), name: s.name.clone(), before: s.linking, after: linking };
+        s.linking = linking;
+        self.changed_for_good(op);
     }
 
     /// Remove feature `ix` as one undo step. The bases stay.
@@ -485,8 +603,8 @@ impl Document {
             return;
         }
         let before = self.snapshot();
-        Rc::make_mut(&mut self.features).remove(ix);
-        self.changed(before, Vec::new());
+        let feature = Rc::make_mut(&mut self.features).remove(ix);
+        self.changed(before, vec![Op::RemoveFeature { ix, feature: FeatureRecord::of(&feature) }]);
     }
 
     /// Make `origin` position 0 of a circular sequence. Features keep the bases they
@@ -530,25 +648,40 @@ impl Document {
     }
 
     /// Attach a structure. Not an undo step (undo covers the sequence and features),
-    /// but it marks the document changed so it gets saved.
+    /// but it is logged and marks the document changed so it gets saved.
     pub fn add_structure(&mut self, structure: Structure) {
+        let op = Op::AttachStructure {
+            id: structure.id.clone(),
+            name: structure.name.clone(),
+            format: structure.format,
+            source: structure.source.clone(),
+            bytes: structure.data.len(),
+        };
         self.structures.push(structure);
-        self.version += 1;
-        self.dirty = true;
+        self.changed_for_good(op);
     }
 
     pub fn remove_structure(&mut self, ix: usize) {
-        if ix < self.structures.len() {
-            let id = self.structures.remove(ix).id;
-            // Features stop naming it. Not an undo step, like the removal itself.
-            if self.features.iter().any(|f| f.structure_refs().iter().any(|(s, _)| *s == id)) {
-                for f in Rc::make_mut(&mut self.features).iter_mut() {
-                    f.set_structure_chains(&id, &[]);
+        if ix >= self.structures.len() {
+            return;
+        }
+        let s = self.structures.remove(ix);
+        // Features stop naming it. Not an undo step, like the removal itself.
+        let mut edits = Vec::new();
+        if self.features.iter().any(|f| f.structure_refs().iter().any(|(id, _)| *id == s.id)) {
+            for (ix, f) in Rc::make_mut(&mut self.features).iter_mut().enumerate() {
+                let was = FeatureRecord::of(f);
+                f.set_structure_chains(&s.id, &[]);
+                let now = FeatureRecord::of(f);
+                if was != now {
+                    edits.push(Op::EditFeature { ix, before: was, after: now });
                 }
             }
-            self.version += 1;
-            self.dirty = true;
         }
+        for op in edits {
+            self.log(op);
+        }
+        self.changed_for_good(Op::RemoveStructure { id: s.id, name: s.name });
     }
 
     pub fn undo(&mut self) -> bool {
@@ -605,7 +738,7 @@ impl Document {
             Format::Native => {
                 let mut saves = self.saves.clone();
                 if saves.last().map(|s| s.rev) != Some(self.revision) {
-                    saves.push(SavePoint { rev: self.revision, time: now(), label: None });
+                    saves.push(SavePoint { rev: self.revision, time: now(), author: author(), label: None });
                 }
                 out = pgx::write(pgx::BundleRef {
                     record: &self.genbank_record(),
@@ -647,7 +780,7 @@ impl Document {
         if self.version == version {
             self.dirty = false;
             if self.format == Format::Native && self.saves.last().map(|s| s.rev) != Some(self.revision) {
-                self.saves.push(SavePoint { rev: self.revision, time: now(), label: None });
+                self.saves.push(SavePoint { rev: self.revision, time: now(), author: author(), label: None });
             }
         }
     }
@@ -690,6 +823,16 @@ pub fn feature_label(f: &GbFeature) -> String {
         .unwrap_or_else(|| f.kind.to_string())
 }
 
+
+/// Interchange formats write bases in lower case by convention (GenBank always does),
+/// so a sequence with no capitals says nothing about case and is shown in capitals.
+/// Mixed case is kept: lower case often marks a region.
+fn conventional_case(mut seq: Vec<u8>) -> Vec<u8> {
+    if !seq.iter().any(u8::is_ascii_uppercase) {
+        seq.make_ascii_uppercase();
+    }
+    seq
+}
 fn convert_feature(f: &GbFeature, len: usize) -> Option<Feature> {
     let (mut segments, strand) = location_segments(&f.location);
     segments.retain(|(s, e)| s < e && *e <= len);
@@ -759,8 +902,9 @@ fn to_gb_feature(f: &Feature) -> GbFeature {
     }
 }
 
+/// The complementary IUPAC code, in the same case.
 pub fn complement(b: u8) -> u8 {
-    match b {
+    let c = match b.to_ascii_uppercase() {
         b'A' => b'T',
         b'T' => b'A',
         b'G' => b'C',
@@ -774,12 +918,9 @@ pub fn complement(b: u8) -> u8 {
         b'V' => b'B',
         b'D' => b'H',
         b'H' => b'D',
-        b'a' => b't',
-        b't' => b'a',
-        b'g' => b'c',
-        b'c' => b'g',
-        other => other,
-    }
+        _ => return b,
+    };
+    if b.is_ascii_lowercase() { c.to_ascii_lowercase() } else { c }
 }
 
 pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
@@ -790,16 +931,13 @@ pub fn gc_percent(seq: &[u8]) -> f32 {
     if seq.is_empty() {
         return 0.0;
     }
-    let gc = seq.iter().filter(|b| matches!(b, b'G' | b'C' | b'S')).count();
+    let gc = seq.iter().filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C' | b'S')).count();
     gc as f32 * 100.0 / seq.len() as f32
 }
 
-/// Keep only characters that are valid IUPAC nucleotide codes, uppercased.
+/// Keep only characters that are valid IUPAC nucleotide codes, in the case they came in.
 pub fn sanitize_bases(text: &str) -> Vec<u8> {
-    text.bytes()
-        .map(|b| b.to_ascii_uppercase())
-        .filter(|b| b"ACGTURYKMSWBDHVN".contains(b))
-        .collect()
+    text.bytes().filter(|b| b"ACGTURYKMSWBDHVN".contains(&b.to_ascii_uppercase())).collect()
 }
 
 #[cfg(test)]
@@ -816,6 +954,83 @@ mod tests {
                 .collect(),
         );
         d
+    }
+
+    #[test]
+    fn lower_case_bases_are_kept() {
+        assert_eq!(complement(b'a'), b't');
+        assert_eq!(complement(b'G'), b'C');
+        assert_eq!(complement(b'r'), b'y');
+        assert_eq!(complement(b'n'), b'n');
+        assert_eq!(reverse_complement(b"AAcg"), b"cgTT");
+        assert_eq!(sanitize_bases("ac gT-x\nN"), b"acgTN");
+        assert_eq!(gc_percent(b"gcAT"), 50.0);
+
+        let dir = std::env::temp_dir().join("plasmid-gpui-case");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Mixed case survives FASTA; an all-lower-case file is just convention.
+        let mixed = dir.join("mixed.fa");
+        std::fs::write(&mixed, ">m\nACGTacgtACGT\n").unwrap();
+        assert_eq!(&Document::open(&mixed).unwrap().seq[..], b"ACGTacgtACGT");
+        let lower = dir.join("lower.fa");
+        std::fs::write(&lower, ">l\nacgt\n").unwrap();
+        assert_eq!(&Document::open(&lower).unwrap().seq[..], b"ACGT");
+
+        // A .pgx keeps exactly what was typed, even all lower case, and its log.
+        let path = dir.join("typed.pgx");
+        let mut d = Document::new_untitled(&path);
+        d.set_path(&path).unwrap();
+        d.insert(0, b"acgt");
+        d.save().unwrap();
+        let back = Document::open(&path).unwrap();
+        assert_eq!(&back.seq[..], b"acgt");
+        assert_eq!(back.history, d.history);
+    }
+
+    #[test]
+    fn every_saved_change_is_logged_and_survives_a_round_trip() {
+        set_author(Some("ada".into()));
+        let dir = std::env::temp_dir().join("plasmid-gpui-log");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.pgx");
+        let mut d = Document::new_untitled(&path);
+        d.set_path(&path).unwrap();
+        d.insert(0, b"ACGTACGTACGT");
+        let tag = Feature { kind: "misc_feature".into(), label: "tag".into(), segments: vec![(2, 6)], strand: 1, source: None };
+        d.add_feature(tag);
+        let mut f = d.features[0].clone();
+        f.label = "renamed".into();
+        d.replace_feature(0, f);
+        d.remove_feature(0);
+        d.undo();
+        d.save().unwrap();
+        set_author(None);
+
+        let ops: Vec<&str> = d
+            .history
+            .iter()
+            .map(|e| match e.op {
+                Op::Insert { .. } => "insert",
+                Op::AddFeature { .. } => "add",
+                Op::EditFeature { .. } => "edit",
+                Op::RemoveFeature { .. } => "remove",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(ops, ["insert", "add", "edit", "remove", "add"]);
+        assert!(d.history.iter().all(|e| e.author.as_deref() == Some("ada")));
+        assert_eq!(d.saves.last().unwrap().author.as_deref(), Some("ada"));
+        let Op::EditFeature { before, after, .. } = &d.history[2].op else { unreachable!() };
+        assert_eq!((before.label.as_str(), after.label.as_str()), ("tag", "renamed"));
+
+        let back = Document::open(&path).unwrap();
+        assert_eq!(back.history, d.history);
+        assert_eq!(back.saves, d.saves);
+        assert_eq!(back.features[0].label, "renamed");
+
+        // Save As under a new name logs the rename.
+        d.set_path(&dir.join("log2.pgx")).unwrap();
+        assert_eq!(d.history.last().unwrap().op, Op::Rename { before: "log".into(), after: "log2".into() });
     }
 
     #[test]
@@ -870,6 +1085,7 @@ mod tests {
             match &e.op {
                 Op::Delete { pos, bases } => drop(seq.drain(*pos..*pos + bases.len())),
                 Op::Insert { pos, bases } => drop(seq.splice(*pos..*pos, bases.bytes())),
+                _ => {}
             }
         }
         assert_eq!(&seq[..], &d.seq[..]);
@@ -984,6 +1200,7 @@ mod tests {
             match &e.op {
                 Op::Insert { pos, bases } => drop(seq.drain(*pos..pos + bases.len())),
                 Op::Delete { pos, bases } => drop(seq.splice(*pos..*pos, bases.bytes())),
+                _ => {}
             }
         }
         assert_eq!(seq, b"ACGT");

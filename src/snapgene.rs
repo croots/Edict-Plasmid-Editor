@@ -53,7 +53,7 @@ pub fn parse(bytes: &[u8]) -> Result<Seq> {
             0x00 if !have_seq => {
                 let (&flags, bases) = payload.split_first().context("empty SnapGene sequence packet")?;
                 record.topology = if flags & 1 != 0 { Topology::Circular } else { Topology::Linear };
-                record.seq = bases.iter().filter(|b| b.is_ascii_alphabetic()).map(|b| b.to_ascii_uppercase()).collect();
+                record.seq = bases.iter().copied().filter(u8::is_ascii_alphabetic).collect();
                 have_seq = true;
             }
             0x0A => feature_xml = Some(payload),
@@ -250,7 +250,8 @@ mod tests {
         file.extend(packet(0x06, b"<Notes><Description>&lt;html&gt;&lt;body&gt;A test&lt;/body&gt;&lt;/html&gt;</Description></Notes>"));
 
         let r = parse(&file).unwrap();
-        assert_eq!(r.seq, b"ACGTACGTACGTACGTACGT");
+        // The parser keeps case; the document capitalizes an all-lower-case sequence.
+        assert_eq!(r.seq, b"acgtacgtacgtacgtacgt");
         assert_eq!(r.topology, Topology::Circular);
         assert_eq!(r.definition.as_deref(), Some("A test"));
         assert_eq!(r.features.len(), 3);
