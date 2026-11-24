@@ -119,6 +119,33 @@ impl FeatureDialog {
         this
     }
 
+    /// A dialog for a new feature filled in from elsewhere (a BLAST match): its
+    /// segments, strand, type, name and qualifiers, all still editable.
+    pub fn prefilled(
+        segments: &[(usize, usize)],
+        strand: i8,
+        kind: &str,
+        name: &str,
+        qualifiers: &[(String, String)],
+        doc: &Document,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::empty(None, doc, kind, strand, window, cx);
+        for (s, e) in spans_from_segments(segments, doc.len(), doc.circular) {
+            this.add_span(&s.to_string(), &e.to_string(), window, cx);
+        }
+        if this.spans.is_empty() {
+            this.add_span("", "", window, cx);
+        }
+        this.name.update(cx, |i, cx| i.set_text(name, cx));
+        for (k, v) in qualifiers {
+            this.add_qualifier(k, v, window, cx);
+        }
+        this.name.update(cx, |i, cx| i.focus(window, cx));
+        this
+    }
+
     /// A dialog to edit `feature`, the `ix`th of the document.
     pub fn edit(ix: usize, feature: &Feature, doc: &Document, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self::empty(Some(ix), doc, &feature.kind, feature.strand, window, cx);

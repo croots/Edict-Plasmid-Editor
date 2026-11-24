@@ -1,11 +1,13 @@
 mod about;
 mod attach_dialog;
+mod blast;
 mod editor;
 mod feature_dialog;
 mod genetic_code;
 mod history;
 mod hotkeys;
 mod layout;
+mod locks;
 mod map;
 mod map_layout;
 mod model;
@@ -13,6 +15,7 @@ mod panes;
 mod pgx;
 mod sbol;
 mod settings;
+mod tasks;
 mod snapgene;
 mod structure;
 mod structure_render;
@@ -39,6 +42,7 @@ fn main() {
     let initial = args.next().map(PathBuf::from);
 
     Application::new().run(move |cx: &mut App| {
+        tasks::init(cx);
         workspace::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1400.0), px(900.0)), cx);
         cx.open_window(

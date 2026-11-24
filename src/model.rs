@@ -10,6 +10,7 @@ use anyhow::{bail, Context as _, Result};
 use gb_io::seq::{Feature as GbFeature, Location, Seq, Topology};
 use serde::{Deserialize, Serialize};
 
+use crate::locks::{self, Lock};
 use crate::pgx::{self, SavePoint, Structure};
 use crate::genetic_code;
 use crate::snapgene;
@@ -287,6 +288,9 @@ pub struct Document {
     /// Each undo step restores one snapshot; it may cover several logged ops.
     undo: Vec<(Snapshot, Vec<Op>)>,
     redo: Vec<(Snapshot, Vec<Op>)>,
+    /// Regions running tasks depend on; edits that would change them are refused.
+    /// In memory only.
+    locks: Vec<Lock>,
 }
 
 const SEQ_EXTENSIONS: &[&str] =
@@ -355,6 +359,7 @@ impl Document {
             structures: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            locks: Vec::new(),
         }
     }
 
@@ -453,6 +458,7 @@ impl Document {
     }
 
     fn changed(&mut self, before: Snapshot, ops: Vec<Op>) {
+        self.move_locks(&ops, before.seq.len());
         for op in &ops {
             self.log(op.clone());
         }
@@ -462,10 +468,86 @@ impl Document {
         self.dirty = true;
     }
 
+    // ----- locks -----------------------------------------------------------------
+
+    pub fn locks(&self) -> &[Lock] {
+        &self.locks
+    }
+
+    /// Lock `start..end` (through the origin when `start > end`) for task `id`.
+    /// Overlapping locks are fine. False if the range is empty.
+    pub fn lock(&mut self, id: u64, start: usize, end: usize) -> bool {
+        let wraps = start > end;
+        if wraps && !self.circular {
+            return false;
+        }
+        match Lock::new(id, start, end, self.len()) {
+            Some(l) => {
+                self.locks.retain(|l| l.id != id);
+                self.locks.push(l);
+                self.version += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn unlock(&mut self, id: u64) {
+        let n = self.locks.len();
+        self.locks.retain(|l| l.id != id);
+        if self.locks.len() != n {
+            self.version += 1;
+        }
+    }
+
+    pub fn lock_of(&self, id: u64) -> Option<Lock> {
+        self.locks.iter().copied().find(|l| l.id == id)
+    }
+
+
+    /// The lock that inserting at `pos` would break.
+    pub fn insert_blocked(&self, pos: usize) -> Option<u64> {
+        locks::through(&self.locks, &[Op::Insert { pos, bases: "N".into() }], self.len()).err()
+    }
+
+    /// The lock that deleting `[a, b)` would break.
+    pub fn delete_blocked(&self, a: usize, b: usize) -> Option<u64> {
+        if a >= b {
+            return None;
+        }
+        let bases = "N".repeat(b - a);
+        locks::through(&self.locks, &[Op::Delete { pos: a, bases }], self.len()).err()
+    }
+
+    /// The lock that deleting through the origin (`[start, len)` and `[0, end)`) would break.
+    pub fn delete_across_origin_blocked(&self, start: usize, end: usize) -> Option<u64> {
+        self.delete_blocked(start.min(self.len()), self.len()).or_else(|| self.delete_blocked(0, end))
+    }
+
+    /// The lock undoing (or redoing) the last step would break.
+    pub fn step_blocked(&self, undo: bool) -> Option<u64> {
+        let ops = self.step_ops(undo)?;
+        locks::through(&self.locks, &ops, self.len()).err()
+    }
+
+    /// The lock reverting to `rev` would break.
+    pub fn revert_blocked(&self, rev: u64) -> Option<u64> {
+        let (_, _, ops) = self.revert_plan(rev)?;
+        locks::through(&self.locks, &ops, self.len()).err()
+    }
+
+    fn move_locks(&mut self, ops: &[Op], len_before: usize) {
+        match locks::through(&self.locks, ops, len_before) {
+            Ok(moved) => self.locks = moved,
+            // Callers check first; if one didn't, the task can't trust its region.
+            Err(_) => debug_assert!(false, "an edit changed locked bases"),
+        }
+    }
+
     /// Insert `bases` at cursor position `pos` (0..=len). Features that contain the
-    /// insertion point grow; features after it shift.
+    /// insertion point grow; features after it shift. Does nothing inside a lock.
     pub fn insert(&mut self, pos: usize, bases: &[u8]) {
-        if bases.is_empty() {
+        if bases.is_empty() || self.insert_blocked(pos).is_some() {
             return;
         }
         let before = self.snapshot();
@@ -498,7 +580,7 @@ impl Document {
 
     /// Delete `[a, b)`. Features shrink; ones left empty are removed.
     pub fn delete(&mut self, a: usize, b: usize) {
-        if a >= b {
+        if a >= b || self.delete_blocked(a, b).is_some() {
             return;
         }
         let before = self.snapshot();
@@ -512,7 +594,7 @@ impl Document {
         let len = self.len();
         let start = start.min(len);
         let end = end.min(start);
-        if start == len && end == 0 {
+        if (start == len && end == 0) || self.delete_across_origin_blocked(start, end).is_some() {
             return;
         }
         let before = self.snapshot();
@@ -757,14 +839,28 @@ impl Document {
     /// Put the bases and features back as they were at revision `rev`, as one undo
     /// step. Attached structures stay as they are. False if nothing would change.
     pub fn revert_to(&mut self, rev: u64) -> bool {
-        if rev >= self.revision {
+        if self.revert_blocked(rev).is_some() {
             return false;
+        }
+        let Some((seq, features, ops)) = self.revert_plan(rev) else { return false };
+        let before = self.snapshot();
+        self.seq = Rc::new(seq);
+        self.features = Rc::new(features);
+        self.changed(before, ops);
+        true
+    }
+
+    /// What reverting to `rev` would change: the bases and features it restores, and
+    /// the ops it logs. None if nothing would change.
+    fn revert_plan(&self, rev: u64) -> Option<(Vec<u8>, Vec<Feature>, Vec<Op>)> {
+        if rev >= self.revision {
+            return None;
         }
         let (seq, features) = self.state_at(rev);
         let now: Vec<FeatureRecord> = self.features.iter().map(FeatureRecord::of).collect();
         let then: Vec<FeatureRecord> = features.iter().map(FeatureRecord::of).collect();
         if seq == *self.seq && now == then {
-            return false;
+            return None;
         }
         let mut ops = vec![Op::Revert { to: rev }];
         if seq != *self.seq {
@@ -793,11 +889,7 @@ impl Document {
         for ix in now.len()..then.len() {
             ops.push(Op::AddFeature { ix, feature: then[ix].clone() });
         }
-        let before = self.snapshot();
-        self.seq = Rc::new(seq);
-        self.features = Rc::new(features);
-        self.changed(before, ops);
-        true
+        Some((seq, features, ops))
     }
 
     pub fn undo(&mut self) -> bool {
@@ -810,17 +902,27 @@ impl Document {
 
     /// Undo and redo restore snapshots, and are logged as edits in their own right so
     /// the history matches what actually happened to the sequence.
-    fn step(&mut self, undo: bool) -> bool {
-        let popped = if undo { self.undo.pop() } else { self.redo.pop() };
-        let Some((snap, ops)) = popped else { return false };
-        let current = self.snapshot();
+    /// The ops undoing (or redoing) the last step logs, in order.
+    fn step_ops(&self, undo: bool) -> Option<Vec<Op>> {
+        let (_, ops) = if undo { self.undo.last() } else { self.redo.last() }?;
         // The step's own bookkeeping described the state before it, not this one.
         let replay = |op: &&Op| !op.is_bookkeeping() && !(undo && matches!(op, Op::Revert { .. }));
-        let logged: Vec<Op> = if undo {
+        Some(if undo {
             ops.iter().rev().filter(replay).map(Op::inverse).collect()
         } else {
             ops.iter().filter(replay).cloned().collect()
-        };
+        })
+    }
+
+    fn step(&mut self, undo: bool) -> bool {
+        if self.step_blocked(undo).is_some() {
+            return false;
+        }
+        let Some(logged) = self.step_ops(undo) else { return false };
+        let popped = if undo { self.undo.pop() } else { self.redo.pop() };
+        let Some((snap, ops)) = popped else { return false };
+        let current = self.snapshot();
+        self.move_locks(&logged, current.seq.len());
         // Restoring a snapshot can bring back features the base edits had cut or
         // dropped. If reading the log backwards wouldn't get today's features back,
         // the log keeps them as they are.
@@ -1530,5 +1632,69 @@ mod tests {
         assert!(!d.format.writable());
         assert_eq!(d.len(), 1000);
         assert_eq!(d.features.len(), 4);
+    }
+
+    #[test]
+    fn locks_refuse_edits_to_their_bases_and_follow_others() {
+        let mut d = doc("AAAACCCCGGGGTTTT", vec![(4, 8)]);
+        assert!(d.lock(1, 4, 8));
+        let locked = |d: &Document| d.lock_of(1).unwrap().bases(&d.seq);
+        // Refused, and nothing changes.
+        assert_eq!(d.insert_blocked(5), Some(1));
+        d.insert(5, b"T");
+        d.delete(3, 5);
+        assert_eq!(&d.seq[..], b"AAAACCCCGGGGTTTT");
+        assert_eq!(d.revision, 0);
+        // Edits around it move it along.
+        d.insert(0, b"TT");
+        d.delete(10, 12);
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((6, 10)));
+        assert_eq!(locked(&d), b"CCCC");
+        // Feature edits inside it are fine.
+        d.remove_feature(0);
+        assert!(d.features.is_empty());
+        // Undo goes back through the deletion and the insertion, moving the lock back.
+        assert!(d.undo() && d.undo() && d.undo());
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((4, 8)));
+        assert!(d.redo());
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((6, 10)));
+        d.unlock(1);
+        assert!(d.locks().is_empty());
+    }
+
+    #[test]
+    fn undo_and_revert_are_refused_when_they_would_change_locked_bases() {
+        let mut d = doc("AAAACCCCGGGG", vec![]);
+        d.insert(6, b"TTT"); // AAAACCTTTCCGGGG
+        let rev = d.revision;
+        d.lock(1, 4, 11); // CCTTTCC
+        assert_eq!(d.step_blocked(true), Some(1));
+        assert!(!d.undo());
+        assert_eq!(d.revert_blocked(0), Some(1));
+        assert!(!d.revert_to(0));
+        assert_eq!(d.seq.len(), 15);
+        // A change outside it can still be undone, and reverted.
+        d.insert(15, b"A");
+        assert_eq!(d.step_blocked(true), None);
+        assert!(d.undo());
+        d.insert(0, b"G");
+        assert!(d.revert_to(rev));
+        assert_eq!(&d.seq[..], b"AAAACCTTTCCGGGG");
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((4, 11)));
+    }
+
+    #[test]
+    fn reindexing_rotates_locks_and_undo_rotates_them_back() {
+        let mut d = doc("AAAACCCCGGGGTTTT", vec![]);
+        d.circular = true;
+        d.lock(1, 2, 6); // AACC
+        d.set_origin(4);
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((14, 2)));
+        assert_eq!(d.lock_of(1).unwrap().bases(&d.seq), b"AACC");
+        assert!(d.undo());
+        assert_eq!(d.lock_of(1).map(|l| (l.start, l.end)), Some((2, 6)));
+        // A wrapping lock can't go on a linear sequence.
+        let mut l = doc("ACGT", vec![]);
+        assert!(!l.lock(1, 3, 1));
     }
 }

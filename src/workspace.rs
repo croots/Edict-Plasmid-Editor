@@ -15,6 +15,8 @@ use crate::hotkeys;
 use crate::panes::{self, PaneGroup};
 use crate::model::{self, Document};
 use crate::settings::{self, Settings};
+use crate::tasks::{self, TaskStatus};
+use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{self, ThemeEntry, ThemeSource};
 
 actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
@@ -84,6 +86,7 @@ struct TreeEntry {
 enum SettingsPage {
     Appearance,
     Hotkeys,
+    Keys,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -114,6 +117,11 @@ pub struct Workspace {
     theme_scroll: UniformListScrollHandle,
     /// A workspace-level problem (file dialog failed, settings not saved).
     notice: Option<SharedString>,
+    /// Settings → Keys: the address sent to NCBI with BLAST searches.
+    email_input: Entity<TextInput>,
+    /// The task last shown in front, to notice when another comes forward.
+    shown_task: Option<tasks::TaskId>,
+    _tasks: gpui::Subscription,
 }
 
 impl Workspace {
@@ -122,6 +130,33 @@ impl Workspace {
         expanded.insert(root.clone());
         let focus = cx.focus_handle();
         window.focus(&focus);
+        let settings = Settings::load();
+        let email_input = cx.new(|cx| TextInput::new(settings.email.clone().unwrap_or_default(), "you@example.org", cx));
+        cx.subscribe(&email_input, |this, input, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Changed) {
+                let text = input.read(cx).text().trim().to_string();
+                this.settings.email = (!text.is_empty()).then_some(text);
+                this.persist(cx);
+            }
+        })
+        .detach();
+        let _tasks = cx.observe_in(&tasks::manager(cx), window, |this: &mut Self, m, window, cx| {
+            let front = m.read(cx).foreground;
+            if front != this.shown_task {
+                this.shown_task = front;
+                match front.and_then(|id| m.read(cx).task(id).map(|t| t.editor.clone())) {
+                    // A task came forward: show its file, and take focus off the editor behind it.
+                    Some(editor) => {
+                        if let Some(ix) = this.tabs.iter().position(|t| matches!(&t.content, TabContent::Editor(ed, _) if ed.downgrade() == editor)) {
+                            this.active = Some(ix);
+                        }
+                        window.focus(&this.focus);
+                    }
+                    None => this.refocus_editor(window, cx),
+                }
+            }
+            cx.notify();
+        });
         let mut ws = Self {
             root,
             expanded,
@@ -133,14 +168,18 @@ impl Workspace {
             settings_open: false,
             settings_page: SettingsPage::Appearance,
             about: None,
-            settings: Settings::load(),
+            settings,
             themes: Vec::new(),
             custom_errors: Vec::new(),
             theme_filter: ThemeFilter::All,
             theme_scroll: UniformListScrollHandle::new(),
             notice: None,
+            email_input,
+            shown_task: None,
+            _tasks,
         };
         crate::model::set_author(ws.settings.effective_author());
+        settings::set_shared(ws.settings.clone());
         ws.reload_themes();
         if let Some(entry) = ws.themes.iter().find(|t| t.id == ws.settings.theme) {
             theme::set(entry.theme());
@@ -318,17 +357,28 @@ impl Workspace {
             .iter()
             .filter(|t| matches!(&t.content, TabContent::Editor(ed, _) if ed.read(cx).doc.dirty))
             .count();
-        if unsaved == 0 {
+        let (running, finished) = {
+            let m = tasks::manager(cx);
+            let m = m.read(cx);
+            let real = m.tasks().iter().filter(|t| t.status != TaskStatus::Draft);
+            (real.clone().filter(|t| t.status.active()).count(), real.filter(|t| t.status.finished()).count())
+        };
+        if unsaved == 0 && running == 0 && finished == 0 {
             cx.quit();
             return;
         }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("{unsaved} file{} unsaved changes", if unsaved == 1 { " has" } else { "s have" }),
-            Some("Quit anyway and lose them?"),
-            &["Quit", "Cancel"],
-            cx,
-        );
+        let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut parts = Vec::new();
+        if unsaved > 0 {
+            parts.push(plural(unsaved, "file has unsaved changes", "files have unsaved changes"));
+        }
+        if running > 0 {
+            parts.push(plural(running, "task is still running", "tasks are still running"));
+        }
+        if finished > 0 {
+            parts.push(plural(finished, "task has results that will be lost", "tasks have results that will be lost"));
+        }
+        let answer = window.prompt(PromptLevel::Warning, &parts.join("; "), Some("Quit anyway?"), &["Quit", "Cancel"], cx);
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(0) {
                 cx.update(|cx| cx.quit()).ok();
@@ -345,7 +395,43 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close a tab, asking first if tasks are running on or holding results for its file.
     fn close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(TabContent::Editor(ed, _)) = self.tabs.get(ix).map(|t| &t.content) else {
+            return self.close_now(ix, window, cx);
+        };
+        let weak = ed.downgrade();
+        let busy = tasks::manager(cx).read(cx).for_editor(&weak).len();
+        if busy == 0 {
+            return self.close_now(ix, window, cx);
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("{busy} task{} use this file", if busy == 1 { "" } else { "s" }),
+            Some("Closing it cancels them and throws away their results."),
+            &["Close", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(ix) = this.tabs.iter().position(|t| matches!(&t.content, TabContent::Editor(e, _) if e.downgrade() == weak)) {
+                        this.close_now(ix, window, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn close_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let TabContent::Editor(ed, _) = &self.tabs[ix].content {
+            let weak = ed.downgrade();
+            let manager = tasks::manager(cx);
+            let ids: Vec<_> = manager.read(cx).tasks().iter().filter(|t| t.editor == weak).map(|t| t.id).collect();
+            manager.update(cx, |m, cx| ids.into_iter().for_each(|id| m.dismiss(id, cx)));
+        }
         self.tabs.remove(ix);
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
@@ -402,6 +488,15 @@ impl Workspace {
     }
 
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let manager = tasks::manager(cx);
+        if let Some(id) = manager.read(cx).foreground {
+            // Escape sends a task to the background, except a dialog not yet run,
+            // whose options would be lost.
+            if manager.read(cx).task(id).is_some_and(|t| t.status != TaskStatus::Draft) {
+                manager.update(cx, |m, cx| m.background(cx));
+            }
+            return;
+        }
         if self.menu_open || self.settings_open || self.about.is_some() {
             self.menu_open = false;
             self.settings_open = false;
@@ -463,6 +558,9 @@ impl Workspace {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        // The BLAST dialog saves its options through the shared copy; keep them.
+        self.settings.blast = settings::shared().blast;
+        settings::set_shared(self.settings.clone());
         if let Err(e) = self.settings.save() {
             self.set_notice(format!("Settings not saved: {e:#}"), cx);
         }
@@ -615,6 +713,93 @@ impl Workspace {
                 )
                 .flex_1(),
             )
+            .children(self.task_list(cx))
+    }
+
+    /// The bottom of the sidebar: searches and other tasks, running or finished.
+    fn task_list(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let manager = tasks::manager(cx);
+        let m = manager.read(cx);
+        let rows: Vec<_> = m
+            .tasks()
+            .iter()
+            .filter(|t| t.status != TaskStatus::Draft)
+            .map(|t| {
+                let id = t.id;
+                let active = t.status.active();
+                let colour = match &t.status {
+                    TaskStatus::Failed(_) => theme::error(),
+                    TaskStatus::Running | TaskStatus::Queued | TaskStatus::Cancelling => theme::accent(),
+                    _ => theme::muted_text(),
+                };
+                let front = m.foreground == Some(id);
+                div()
+                    .id(("task", id as usize))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(front, |d| d.bg(theme::active()))
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(colour).flex_none())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().overflow_hidden().whitespace_nowrap().text_ellipsis().child(format!("{}: {}", t.kind, t.title)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted_text())
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(match (&t.status, &t.progress) {
+                                        (TaskStatus::Running, Some(p)) => p.clone(),
+                                        (s, _) => s.label().to_string(),
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("task-x", id as usize))
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(theme::muted_text())
+                            .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                            .child("×")
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                // A first click stops a running task; a second clears it away.
+                                tasks::manager(cx).update(cx, |m, cx| if active { m.cancel(id, cx) } else { m.dismiss(id, cx) })
+                            }),
+                    )
+                    .on_click(move |_, _, cx| tasks::manager(cx).update(cx, |m, cx| m.bring_forward(id, cx)))
+            })
+            .collect();
+        (!rows.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .max_h(px(260.0))
+                .border_t_1()
+                .border_color(theme::border())
+                .child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::muted_text())
+                        .child("TASKS"),
+                )
+                .child(div().id("task-rows").flex().flex_col().overflow_y_scroll().pb_1().children(rows))
+        })
     }
 
     fn tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -872,6 +1057,7 @@ impl Workspace {
                     .child(div().font_weight(gpui::FontWeight::SEMIBOLD).mr_4().child("Settings"))
                     .child(page_tab("page-appearance", "Appearance", SettingsPage::Appearance, self.settings_page))
                     .child(page_tab("page-hotkeys", "Hotkeys", SettingsPage::Hotkeys, self.settings_page))
+                    .child(page_tab("page-keys", "Keys", SettingsPage::Keys, self.settings_page))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -886,6 +1072,7 @@ impl Workspace {
                     ),
             )
             .when(self.settings_page == SettingsPage::Hotkeys, |d| d.child(hotkeys_page()))
+            .when(self.settings_page == SettingsPage::Keys, |d| d.child(self.keys_page()))
             .when(self.settings_page == SettingsPage::Appearance, |d| {
                 // Theme picker
                 d.child(
@@ -1008,6 +1195,48 @@ impl Workspace {
                     .child(format!("Saved to {config_hint}")),
             )
     }
+
+    /// Settings → Keys: contact details and keys for online services.
+    fn keys_page(&self) -> impl IntoElement {
+        let heading = |text: &'static str| {
+            div().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::muted_text()).child(text)
+        };
+        let missing = self.settings.email.is_none();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .h(px(470.0))
+            .child(heading("NCBI"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(60.0)).text_sm().child("Email"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(theme::app_bg())
+                            .text_sm()
+                            .child(self.email_input.clone()),
+                    ),
+            )
+            .child(div().text_xs().text_color(theme::muted_text()).child(
+                "BLAST searches send this address to NCBI with the tool name (plasmid-gpui), as NCBI's usage rules ask, \
+                 so they can get in touch about a problem before blocking heavy use. It goes nowhere else.",
+            ))
+            .when(missing, |d| {
+                d.child(div().text_xs().text_color(theme::error()).child("BLAST needs an email address before it can run."))
+            })
+    }
 }
 
 /// Settings → Hotkeys: every shortcut, grouped by where it applies.
@@ -1078,6 +1307,11 @@ fn swatch_strip(sw: &[Hsla; 16]) -> impl IntoElement {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let task_view = {
+            let m = tasks::manager(cx);
+            let m = m.read(cx);
+            m.foreground.and_then(|id| m.task(id)).map(|t| t.view.clone())
+        };
         let body = match self.active.map(|a| &self.tabs[a].content) {
             Some(TabContent::Editor(_, panes)) => div().size_full().child(panes.clone()),
             Some(TabContent::Failed(msg)) => div().p_4().text_color(theme::error()).child(msg.clone()),
@@ -1182,6 +1416,21 @@ impl Render for Workspace {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx)))
                         .child(self.settings_panel(cx)),
+                )
+            })
+            .when_some(task_view, |d, view| {
+                d.child(
+                    div()
+                        .id("task-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                        .occlude()
+                        .child(view),
                 )
             })
             .when_some(self.about.clone(), |d, panel| {

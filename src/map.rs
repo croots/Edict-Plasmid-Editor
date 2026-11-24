@@ -15,6 +15,7 @@ use gpui::{
 
 use crate::editor::{self, thousands, SeqEditor, Selection};
 use crate::map_layout::{self, Placed, Placement};
+use crate::locks::Lock;
 use crate::model::Feature;
 use crate::sbol::{self, Align, Glyph, Paint, Sizing};
 use crate::theme;
@@ -352,6 +353,9 @@ impl Geo {
     }
 }
 
+/// Half the width of the locked band, in track units (pixels).
+const LOCK_BAND: f32 = 5.0;
+
 // ----- painting --------------------------------------------------------------------
 
 /// Points along a polyline in track space, subdivided so straight segments bend
@@ -410,6 +414,7 @@ struct PaintCtx {
     selection: Selection,
     cursor: usize,
     focused: bool,
+    locks: Rc<Vec<Lock>>,
 }
 
 fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -432,6 +437,16 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
     for (s, e) in spans {
         let pts = project(proj, &band(s as f32 * k, e as f32 * k, v_bot, v_top), true);
         paint_poly(window, &pts, true, None, false, theme::selection());
+    }
+
+    // Locked bases: a band along the backbone.
+    for l in ctx.locks.iter() {
+        let spans: Vec<(usize, usize)> =
+            if l.wraps() && proj.curved() { vec![(l.start, l.end + geo.len)] } else { l.parts(geo.len) };
+        for (s, e) in spans {
+            let pts = project(proj, &band(s as f32 * k, e as f32 * k, -LOCK_BAND, LOCK_BAND), true);
+            paint_poly(window, &pts, true, None, false, theme::accent().opacity(0.45));
+        }
     }
 
     // Backbone.
@@ -608,6 +623,7 @@ struct MouseCtx {
     /// The document is circular, so drags on the circular map may cross the origin.
     circular: bool,
     drag: Rc<Cell<Option<Drag>>>,
+    locks: Rc<Vec<Lock>>,
 }
 
 /// A drag along the backbone. Around a circle it follows the pointer's path, so the
@@ -680,6 +696,14 @@ fn register_mouse(m: MouseCtx, proj: Proj, hitbox: gpui::Hitbox, window: &mut Wi
             let msg: SharedString = format!("{} · {} · {} bp", map_label(&f.label), it.glyph.name(), it.end - it.start).into();
             mc.drag.set(None);
             mc.editor.update(cx, |ed, cx| ed.select(s, e, wraps, Some(msg), cx));
+        } else if let Some(ids) = (v.abs() <= LOCK_BAND + 3.0 && !ev.modifiers.shift)
+            .then(|| mc.locks.iter().filter(|l| l.contains(base % mc.geo.len.max(1))).map(|l| l.id).collect::<Vec<_>>())
+            .filter(|ids| !ids.is_empty())
+        {
+            // On the locked band: bring its task forward.
+            mc.drag.set(None);
+            let at = ev.position;
+            mc.editor.update(cx, |ed, cx| ed.locked_click(at, ids, cx));
         } else {
             let drag = Drag::new(base, mc.geo.len, circular);
             mc.drag.set(Some(drag));
@@ -761,8 +785,9 @@ impl Render for DnaMap {
             let top = (geo.y_base - h / 2.0).clamp(0.0, (content_h - h).max(0.0));
             self.scroll.set_offset(point(px(0.0), px(-top)));
         }
-        let paint = PaintCtx { geo: geo.clone(), name, selection, cursor, focused };
-        let mouse = MouseCtx { geo: geo.clone(), features, editor: self.editor.clone(), editor_focus, circular: len > 0 && ed_circular, drag: self.drag.clone() };
+        let locks = Rc::new(ed.doc.locks().to_vec());
+        let paint = PaintCtx { geo: geo.clone(), name, selection, cursor, focused, locks: locks.clone() };
+        let mouse = MouseCtx { geo: geo.clone(), features, editor: self.editor.clone(), editor_focus, circular: len > 0 && ed_circular, drag: self.drag.clone(), locks };
 
         let map = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),

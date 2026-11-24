@@ -21,6 +21,8 @@ use crate::map_layout;
 use crate::model::{self, Document, Feature, Format};
 use crate::pgx::{self, ChainLinking};
 use crate::genetic_code;
+use crate::locks::Lock;
+use crate::tasks;
 use crate::structure::{self, Molecule};
 use crate::theme;
 use crate::workspace::Dismiss;
@@ -66,6 +68,8 @@ pub struct SeqEditor {
     /// For one document version, the features each automatically linked structure's
     /// chains align to: (structure id, feature indices).
     auto_links: Option<(u64, Vec<(String, Vec<usize>)>)>,
+    /// Where several locks overlap and one was clicked: where, and the tasks to pick from.
+    lock_chooser: Option<(Point<Pixels>, Vec<u64>)>,
 }
 
 /// Things the editor asks of the panes around it.
@@ -171,6 +175,7 @@ struct RowCtx {
     focused: bool,
     editor: WeakEntity<SeqEditor>,
     focus: FocusHandle,
+    locks: Rc<Vec<Lock>>,
 }
 
 impl SeqEditor {
@@ -195,6 +200,7 @@ impl SeqEditor {
             dialog: None,
             translations: None,
             auto_links: None,
+            lock_chooser: None,
         }
     }
 
@@ -243,6 +249,10 @@ impl SeqEditor {
     /// Put the bases and features back as they were at revision `rev` (the History
     /// pane), as one undo step.
     pub fn revert_to(&mut self, rev: u64, what: &str, cx: &mut Context<Self>) {
+        if self.locked(self.doc.revert_blocked(rev), cx) {
+            cx.notify();
+            return;
+        }
         let message = if self.doc.revert_to(rev) {
             format!("Reverted to {what} · undo to put it back")
         } else {
@@ -329,6 +339,92 @@ impl SeqEditor {
         self.rows.scroll_to_reveal_item(self.head / self.bases_per_row());
     }
 
+    /// If `lock` (an edit's blocking lock) is set, say what holds it and return true.
+    fn locked(&mut self, lock: Option<u64>, cx: &App) -> bool {
+        let Some(id) = lock else { return false };
+        let what = tasks::manager(cx)
+            .read(cx)
+            .task(id)
+            .map_or_else(|| "a task".to_string(), |t| format!("{}: {}", t.kind, t.title));
+        self.message = Some(format!("Locked by {what} · click the region to view it").into());
+        true
+    }
+
+    /// The lock that replacing the selection (or typing at the cursor) would break.
+    fn selection_blocked(&self) -> Option<u64> {
+        let sel = self.selection();
+        if sel.is_empty() {
+            self.doc.insert_blocked(self.head)
+        } else if sel.wraps() {
+            self.doc.delete_across_origin_blocked(sel.start, sel.end)
+        } else {
+            self.doc.delete_blocked(sel.start, sel.end)
+        }
+    }
+
+    /// The selection can be deleted or replaced; if not, say why.
+    fn selection_editable(&mut self, cx: &App) -> bool {
+        !self.locked(self.selection_blocked(), cx)
+    }
+
+    /// Clicked locked bases: bring the task that holds them forward, or offer a choice
+    /// when several locks overlap there.
+    pub fn locked_click(&mut self, at: Point<Pixels>, ids: Vec<u64>, cx: &mut Context<Self>) {
+        self.dragging = false;
+        match ids.as_slice() {
+            [] => {}
+            [id] => {
+                let id = *id;
+                tasks::manager(cx).update(cx, |m, cx| m.bring_forward(id, cx));
+            }
+            _ => self.lock_chooser = Some((at, ids)),
+        }
+        cx.notify();
+    }
+
+    /// BLAST the selection: open the search dialog as a new task.
+    fn blast(&mut self, cx: &mut Context<Self>) {
+        let sel = self.selection();
+        if sel.is_empty() {
+            return;
+        }
+        let editor = cx.entity().downgrade();
+        let region = crate::blast::dialog::Region {
+            start: sel.start,
+            end: sel.end,
+            bases: sel.bases(&self.doc.seq),
+            doc_name: self.doc.name.clone(),
+            version: self.doc.version,
+        };
+        let title = region.describe();
+        tasks::manager(cx).update(cx, |m, cx| {
+            m.create(
+                "BLAST",
+                title,
+                editor.clone(),
+                |id, cx| cx.new(|cx| crate::blast::dialog::BlastView::new(id, editor, region, cx)).into(),
+                cx,
+            );
+        });
+    }
+
+    /// Open the Create Feature dialog filled in from elsewhere (a BLAST match).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_feature_from(
+        &mut self,
+        segments: &[(usize, usize)],
+        strand: i8,
+        kind: &str,
+        name: &str,
+        qualifiers: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = &self.doc;
+        let dialog = cx.new(|cx| FeatureDialog::prefilled(segments, strand, kind, name, qualifiers, doc, window, cx));
+        self.show_dialog(dialog, window, cx);
+    }
+
     /// Delete the selection and return where it was, as a cursor position.
     fn delete_selection(&mut self) -> usize {
         let sel = self.selection();
@@ -371,6 +467,9 @@ impl SeqEditor {
         let bases = model::sanitize_bases(&text);
         if bases.is_empty() {
             self.message = Some("Nothing to paste: the clipboard has no bases".into());
+            return;
+        }
+        if !self.selection_editable(cx) {
             return;
         }
         self.replace_selection(&bases);
@@ -605,14 +704,17 @@ impl SeqEditor {
                     this.copy(true, cx);
                 }),
                 command("menu-paste", "Paste", "Ctrl+V", true, |this, _, _, cx| this.paste(cx)),
-                command("menu-delete", "Delete", "Del", true, |this, _, _, _| {
-                    let at = this.delete_selection();
-                    this.set_cursor(at, false);
+                command("menu-delete", "Delete", "Del", true, |this, _, _, cx| {
+                    if this.selection_editable(cx) {
+                        let at = this.delete_selection();
+                        this.set_cursor(at, false);
+                    }
                 }),
                 separator().into_any_element(),
                 command("menu-create-feature", "Create Feature…", "", true, |this, _, window, cx| {
                     this.create_feature(window, cx)
                 }),
+                command("menu-blast", "BLAST…", "Search NCBI", true, |this, _, _, cx| this.blast(cx)),
             ]
         } else {
             let circular = self.doc.circular;
@@ -671,6 +773,55 @@ impl SeqEditor {
         )
     }
 
+    /// Which of the overlapping locks' tasks to show.
+    fn lock_chooser_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (at, ids) = self.lock_chooser.as_ref()?;
+        let manager = tasks::manager(cx);
+        let m = manager.read(cx);
+        let rows: Vec<AnyElement> = ids
+            .iter()
+            .filter_map(|&id| {
+                let t = m.task(id)?;
+                Some(
+                    div()
+                        .id(("lock-choice", id as usize))
+                        .flex()
+                        .flex_row()
+                        .gap_3()
+                        .px_3()
+                        .py(px(3.0))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .child(div().flex_1().child(format!("{}: {}", t.kind, t.title)))
+                        .child(div().text_xs().text_color(theme::muted_text()).child(t.status.label()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.lock_chooser = None;
+                            tasks::manager(cx).update(cx, |m, cx| m.bring_forward(id, cx));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+            })
+            .collect();
+        Some(
+            deferred(
+                anchored().position(*at).snap_to_window_with_margin(px(8.0)).child(
+                    menu_panel()
+                        .id("lock-chooser")
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.lock_chooser = None;
+                            cx.notify();
+                        }))
+                        .child(div().px_3().py_1().text_xs().text_color(theme::muted_text()).child("These bases are locked by:"))
+                        .children(rows),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keys the dialog's fields don't use mustn't edit the sequence behind it.
         if self.dialog.is_some() {
@@ -684,7 +835,7 @@ impl SeqEditor {
         let sel = self.selection();
         self.message = None;
         // Any key closes the context menu; Escape does nothing else.
-        let had_menu = self.menu.take().is_some();
+        let had_menu = self.menu.take().is_some() | self.lock_chooser.take().is_some();
         match (cmd, ks.key.as_str()) {
             (_, "escape") if had_menu => {}
             (true, "a") => {
@@ -696,23 +847,22 @@ impl SeqEditor {
                 if !self.copy(m.shift, cx) {
                     return;
                 }
-                if ks.key == "x" {
+                if ks.key == "x" && self.selection_editable(cx) {
                     let at = self.delete_selection();
                     self.set_cursor(at, false);
                 }
             }
             (true, "v") => self.paste(cx),
-            (true, "z") if m.shift => {
-                self.doc.redo();
-                self.wraps = false;
-            }
-            (true, "z") => {
-                self.doc.undo();
-                self.wraps = false;
-            }
-            (true, "y") => {
-                self.doc.redo();
-                self.wraps = false;
+            (true, "z") | (true, "y") => {
+                let undo = ks.key == "z" && !m.shift;
+                if !self.locked(self.doc.step_blocked(undo), cx) {
+                    if undo {
+                        self.doc.undo();
+                    } else {
+                        self.doc.redo();
+                    }
+                    self.wraps = false;
+                }
             }
             (true, "s") if m.shift => self.save_as(cx),
             (true, "s") => self.save(window, cx),
@@ -736,18 +886,22 @@ impl SeqEditor {
             (_, "pagedown") => self.set_cursor(self.head + bpr * 10, m.shift),
             (_, "backspace") => {
                 if !sel.is_empty() {
-                    let at = self.delete_selection();
-                    self.set_cursor(at, false);
-                } else if self.head > 0 {
+                    if self.selection_editable(cx) {
+                        let at = self.delete_selection();
+                        self.set_cursor(at, false);
+                    }
+                } else if self.head > 0 && !self.locked(self.doc.delete_blocked(self.head - 1, self.head), cx) {
                     self.doc.delete(self.head - 1, self.head);
                     self.set_cursor(self.head - 1, false);
                 }
             }
             (_, "delete") => {
                 if !sel.is_empty() {
-                    let at = self.delete_selection();
-                    self.set_cursor(at, false);
-                } else if self.head < len {
+                    if self.selection_editable(cx) {
+                        let at = self.delete_selection();
+                        self.set_cursor(at, false);
+                    }
+                } else if self.head < len && !self.locked(self.doc.delete_blocked(self.head, self.head + 1), cx) {
                     self.doc.delete(self.head, self.head + 1);
                 }
             }
@@ -757,7 +911,9 @@ impl SeqEditor {
                 if bases.is_empty() || typed.chars().count() != 1 {
                     return;
                 }
-                self.replace_selection(&bases);
+                if self.selection_editable(cx) {
+                    self.replace_selection(&bases);
+                }
             }
             _ => return,
         }
@@ -1078,6 +1234,7 @@ impl Render for SeqEditor {
             focused: self.focus.is_focused(window),
             editor: cx.entity().downgrade(),
             focus: self.focus.clone(),
+            locks: Rc::new(self.doc.locks().to_vec()),
         };
 
         let me: Entity<Self> = cx.entity();
@@ -1161,6 +1318,7 @@ impl Render for SeqEditor {
             .child(div().relative().flex_1().min_h_0().child(measure).child(rows).child(scrollbar))
             .child(self.status_bar())
             .children(self.context_menu(cx))
+            .children(self.lock_chooser_menu(cx))
             .children(self.dialog.as_ref().map(|d| d.0.clone()))
     }
 }
@@ -1222,6 +1380,18 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
         let (sa, sb) = (part.start.max(row_start), part.end.min(row_end));
         if sa < sb {
             window.paint_quad(fill(rect(col(sa), y_top, (sb - sa) as f32 * m.char_w, 2.0 * m.line_h), theme::selection()));
+        }
+    }
+
+    // Locked bases: a tint behind both strands and a bar above them.
+    for l in ctx.locks.iter() {
+        for (a, b) in l.parts(len) {
+            let (sa, sb) = (a.max(row_start), b.min(row_end));
+            if sa < sb {
+                let (x, w) = (col(sa), (sb - sa) as f32 * m.char_w);
+                window.paint_quad(fill(rect(x, y_top, w, 2.0 * m.line_h), theme::accent().opacity(0.10)));
+                window.paint_quad(fill(rect(x, y_top - 4.0, w, 2.0), theme::accent().opacity(0.8)));
+            }
         }
     }
 
@@ -1357,6 +1527,7 @@ fn register_mouse(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitb
     let features = ctx.features.clone();
     let editor = ctx.editor.clone();
     let focus = ctx.focus.clone();
+    let locks = ctx.locks.clone();
     window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
         // The hitbox rather than the bounds: an open context menu covers the rows under it.
         let button = ev.button;
@@ -1374,6 +1545,17 @@ fn register_mouse(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitb
         let feature = picked.map(|p| (&features[p.feature], p.start, p.end));
         let feature_ix = picked.map(|p| p.feature);
         let pos = hit(ev.position.x);
+        // A plain click on locked bases brings their task forward. Drags that start
+        // outside still select through the lock.
+        if button == MouseButton::Left && !ev.modifiers.shift && lane.is_none() && base >= 0.0 {
+            let i = row_start + base as usize;
+            let ids: Vec<u64> = if i < row_end { locks.iter().filter(|l| l.contains(i)).map(|l| l.id).collect() } else { Vec::new() };
+            if !ids.is_empty() {
+                let at = ev.position;
+                editor.update(cx, |ed, cx| ed.locked_click(at, ids, cx)).ok();
+                return;
+            }
+        }
         editor
             .update(cx, |ed, cx| {
                 if button == MouseButton::Right {
