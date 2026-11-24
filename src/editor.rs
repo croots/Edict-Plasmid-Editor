@@ -32,6 +32,9 @@ const RULER_H: f32 = 22.0;
 const ROW_GAP: f32 = 16.0;
 const MIN_FONT: f32 = 9.0;
 const MAX_FONT: f32 = 24.0;
+/// The scrollbar sits in the right padding, over no sequence.
+const SCROLLBAR_W: f32 = 10.0;
+const MIN_THUMB_H: f32 = 24.0;
 
 pub struct SeqEditor {
     pub doc: Document,
@@ -43,6 +46,8 @@ pub struct SeqEditor {
     /// larger of anchor/head through the origin to the smaller.
     wraps: bool,
     dragging: bool,
+    /// While the scrollbar thumb is dragged: where in the thumb it was grabbed, in pixels.
+    scrollbar_grab: Option<f32>,
     font_size: f32,
     viewport_w: f32,
     cached: Option<(u64, usize, Rc<Layout>)>,
@@ -179,6 +184,7 @@ impl SeqEditor {
             head: 0,
             wraps: false,
             dragging: false,
+            scrollbar_grab: None,
             font_size: 13.0,
             viewport_w: 0.0,
             cached: None,
@@ -1081,6 +1087,32 @@ impl Render for SeqEditor {
         .absolute()
         .size_full();
 
+        // Every row's height is known up front, so the scrollbar is exact even for rows
+        // the list hasn't measured yet. `tops[i]` is the top of row i; the last entry is
+        // the total height.
+        let mut tops = Vec::with_capacity(layout.rows + 1);
+        let mut y = 0.0;
+        tops.push(y);
+        for &lanes in &layout.row_lanes {
+            y += lanes_top + lanes as f32 * lane_h + ROW_GAP;
+            tops.push(y);
+        }
+        let scrollbar = {
+            let tops = Rc::new(tops);
+            let list = self.rows.clone();
+            let editor = cx.entity().downgrade();
+            let grabbed = self.scrollbar_grab.is_some();
+            canvas(
+                |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll),
+                move |bounds, hitbox, window, cx| paint_scrollbar(&tops, &list, &editor, grabbed, bounds, hitbox, window, cx),
+            )
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(SCROLLBAR_W))
+        };
+
         let rows = list(self.rows.clone(), move |row, _window, _cx| {
             let ctx = ctx.clone();
             let lanes = ctx.layout.row_lanes[row] as f32 * lane_h;
@@ -1114,7 +1146,7 @@ impl Render for SeqEditor {
                 }
             }))
             .child(self.toolbar(cx))
-            .child(div().relative().flex_1().min_h_0().child(measure).child(rows))
+            .child(div().relative().flex_1().min_h_0().child(measure).child(rows).child(scrollbar))
             .child(self.status_bar())
             .children(self.context_menu(cx))
             .children(self.dialog.as_ref().map(|d| d.0.clone()))
@@ -1166,7 +1198,8 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
     let row_end = (row_start + bpr).min(len);
     let ox: f32 = f32::from(bounds.origin.x) + PAD_X;
     let oy: f32 = f32::from(bounds.origin.y);
-    let col = |i: usize| ox + (i - row_start) as f32 * m.char_w;
+    // In f32: a codon chevron may ask for a base just before this row.
+    let col = |i: usize| ox + (i as f32 - row_start as f32) * m.char_w;
     let y_top = oy + PAD_TOP;
     let y_bot = y_top + m.line_h;
     let rect = |x0: f32, y0: f32, w: f32, h: f32| Bounds::new(point(px(x0), px(y0)), size(px(w), px(h)));
@@ -1369,6 +1402,102 @@ fn register_mouse(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitb
     let editor = ctx.editor.clone();
     window.on_mouse_event(move |_: &MouseUpEvent, _phase, _window, cx| {
         editor.update(cx, |ed, _| ed.dragging = false).ok();
+    });
+}
+
+/// The vertical scrollbar beside the rows: a thumb sized to the visible share of the
+/// sequence. Drag the thumb, or click the track to jump there and keep dragging.
+#[allow(clippy::too_many_arguments)]
+fn paint_scrollbar(
+    tops: &Rc<Vec<f32>>,
+    list: &ListState,
+    editor: &WeakEntity<SeqEditor>,
+    grabbed: bool,
+    bounds: Bounds<Pixels>,
+    hitbox: Hitbox,
+    window: &mut Window,
+    _cx: &mut App,
+) {
+    let total = tops.last().copied().unwrap_or(0.0);
+    let view_h = f32::from(bounds.size.height);
+    let max_scroll = total - view_h;
+    if max_scroll <= 0.5 || tops.len() < 2 {
+        return;
+    }
+    let thumb_h = (view_h * view_h / total).clamp(MIN_THUMB_H.min(view_h), view_h);
+    let travel = (view_h - thumb_h).max(1.0);
+    let top = list.logical_scroll_top();
+    let row = top.item_ix.min(tops.len() - 1);
+    let scroll = (tops[row] + f32::from(top.offset_in_item)).clamp(0.0, max_scroll);
+    let thumb_y = scroll / max_scroll * travel;
+    let x0 = f32::from(bounds.origin.x);
+    let y0 = f32::from(bounds.origin.y);
+
+    let hovered = hitbox.is_hovered(window);
+    let thumb = Bounds::new(point(px(x0 + 2.0), px(y0 + thumb_y)), size(px(SCROLLBAR_W - 4.0), px(thumb_h)));
+    let alpha = if grabbed { 0.7 } else if hovered { 0.5 } else { 0.3 };
+    window.paint_quad(fill(thumb, theme::muted_text().opacity(alpha)).corner_radii(px((SCROLLBAR_W - 4.0) / 2.0)));
+
+    // Scroll so the thumb's top lands at `y` (relative to the track).
+    let scroll_to = {
+        let tops = tops.clone();
+        let list = list.clone();
+        move |y: f32| {
+            let s = (y / travel).clamp(0.0, 1.0) * max_scroll;
+            let row = tops.partition_point(|&t| t <= s).saturating_sub(1).min(tops.len() - 2);
+            list.scroll_to(ListOffset { item_ix: row, offset_in_item: px(s - tops[row]) });
+        }
+    };
+
+    let editor_down = editor.clone();
+    let scroll_down = scroll_to.clone();
+    let hb = hitbox.clone();
+    window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+        if !phase.bubble() || ev.button != MouseButton::Left || !hb.is_hovered(window) {
+            return;
+        }
+        cx.stop_propagation();
+        let y = f32::from(ev.position.y) - y0;
+        let grab = if y >= thumb_y && y <= thumb_y + thumb_h {
+            y - thumb_y
+        } else {
+            // On the track: centre the thumb on the click and carry on as a drag.
+            scroll_down(y - thumb_h / 2.0);
+            thumb_h / 2.0
+        };
+        editor_down
+            .update(cx, |ed, cx| {
+                ed.scrollbar_grab = Some(grab);
+                cx.notify();
+            })
+            .ok();
+    });
+
+    let editor_move = editor.clone();
+    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+        if !phase.bubble() {
+            return;
+        }
+        let grab = editor_move.update(cx, |ed, _| ed.scrollbar_grab).ok().flatten();
+        match grab {
+            Some(grab) if ev.pressed_button == Some(MouseButton::Left) => {
+                scroll_to(f32::from(ev.position.y) - y0 - grab);
+                editor_move.update(cx, |_, cx| cx.notify()).ok();
+            }
+            _ if hitbox.is_hovered(window) != hovered => window.refresh(),
+            _ => {}
+        }
+    });
+
+    let editor_up = editor.clone();
+    window.on_mouse_event(move |_: &MouseUpEvent, _phase, _window, cx| {
+        editor_up
+            .update(cx, |ed, cx| {
+                if ed.scrollbar_grab.take().is_some() {
+                    cx.notify();
+                }
+            })
+            .ok();
     });
 }
 
