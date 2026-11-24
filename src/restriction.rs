@@ -17,7 +17,7 @@ use crate::theme;
 use crate::workspace::{queue_new_document, NewDocument};
 
 const ROW_H: f32 = 26.0;
-const FRAGMENT_ROW_H: f32 = 40.0;
+const FRAGMENT_ROW_H: f32 = 26.0;
 const GEL_W: f32 = 170.0;
 
 /// Favorites until the user picks their own: the usual cloning enzymes.
@@ -294,42 +294,37 @@ impl RestrictionView {
                             Some(1) => theme::accent(),
                             _ => theme::text(),
                         };
-                        div()
+                        table_row()
                             .id(("enzyme-row", ix))
                             .h(px(ROW_H))
-                            .px_2()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
                             .cursor_pointer()
+                            .when(row % 2 == 1, |d| d.bg(theme::app_bg()))
                             .hover(|s| s.bg(theme::hover()))
                             .when(on, |d| d.bg(theme::active()))
-                            .child(check(on))
+                            .child(col(Col::Check, div()).child(check(on)))
                             .child(
-                                div()
-                                    .w(px(78.0))
-                                    .flex_none()
-                                    .overflow_hidden()
+                                col(Col::Name, div())
+                                    .whitespace_nowrap()
                                     .when(on, |d| d.text_color(theme::accent()).font_weight(FontWeight::SEMIBOLD))
                                     .child(e.name),
                             )
+                            .child(col(Col::Site, div()).text_xs().font(editor_font()).child(e.specificity()))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
+                                col(Col::Ends, div())
                                     .text_xs()
                                     .font(editor_font())
                                     .text_color(theme::muted_text())
-                                    .child(format!("{}  {}", e.specificity(), e.end_description())),
+                                    .child(e.end_description()),
                             )
                             .child(
-                                div()
+                                col(Col::Cuts, div())
+                                    .text_xs()
+                                    .text_color(count_colour)
+                                    .child(count.map_or("…".to_string(), thousands)),
+                            )
+                            .child(
+                                col(Col::Star, div())
                                     .id(("enzyme-star", ix))
-                                    .w(px(16.0))
-                                    .flex_none()
                                     .text_color(if fav { theme::accent() } else { theme::muted_text().opacity(0.5) })
                                     .hover(|s| s.text_color(theme::accent()))
                                     .child(if fav { "★" } else { "☆" })
@@ -337,16 +332,6 @@ impl RestrictionView {
                                         cx.stop_propagation();
                                         this.toggle_favorite(enzymes::all()[ix].name, cx);
                                     })),
-                            )
-                            .child(
-                                div()
-                                    .w(px(34.0))
-                                    .flex_none()
-                                    .flex()
-                                    .justify_end()
-                                    .text_xs()
-                                    .text_color(count_colour)
-                                    .child(count.map_or("…".to_string(), |c| thousands(c))),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.editor.update(cx, |ed, cx| ed.set_enzyme_shown(ix, !on, cx));
@@ -363,19 +348,13 @@ impl RestrictionView {
             .flex_1()
             .min_h_0()
             .child(div().flex().flex_col().gap_1().p_2().border_b_1().border_color(theme::border()).child(search).child(chips))
-            .child(
-                div()
-                    .px_2()
-                    .py(px(3.0))
-                    .flex()
-                    .flex_row()
-                    .text_xs()
-                    .text_color(theme::muted_text())
-                    .border_b_1()
-                    .border_color(theme::border())
-                    .child(div().flex_1().child(format!("{n} enzyme{}", if n == 1 { "" } else { "s" })))
-                    .child("cuts"),
-            )
+            .child(table_header().children(Col::ALL.map(|c| {
+                let title = match c {
+                    Col::Name => format!("Enzyme ({})", thousands(n)),
+                    c => c.title().to_string(),
+                };
+                col(c, div()).child(title)
+            })))
             .children(empty)
             .child(list)
     }
@@ -426,46 +405,29 @@ impl RestrictionView {
                         let i = order[row];
                         let f = frags[i].clone();
                         let end = (f.start + f.len) % n.max(1);
-                        let ends = format!("{} … {}", end_name(f.left.as_ref()), end_name(f.right.as_ref()));
                         let place = if f.circular {
                             "uncut circle".to_string()
                         } else {
-                            format!("{}–{}{}", thousands(f.start + 1), thousands(if end == 0 { n } else { end }), if f.start + f.len > n { " (through the origin)" } else { "" })
+                            // ↻: runs through the origin.
+                            let wraps = if f.start + f.len > n { " ↻" } else { "" };
+                            format!("{}–{}{wraps}", thousands(f.start + 1), thousands(if end == 0 { n } else { end }))
                         };
                         let stem = fragment_stem(&doc_name, &f, i);
-                        div()
+                        table_row()
                             .id(("fragment-row", i))
                             .h(px(FRAGMENT_ROW_H))
-                            .px_2()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
                             .cursor_pointer()
+                            .when(row % 2 == 1, |d| d.bg(theme::app_bg()))
                             .hover(|s| s.bg(theme::hover()))
+                            .child(col(FragCol::Size, div()).font_weight(FontWeight::SEMIBOLD).child(thousands(f.len)))
+                            .child(col(FragCol::Left, div()).text_xs().child(end_name(f.left.as_ref())))
+                            .child(col(FragCol::Right, div()).text_xs().child(end_name(f.right.as_ref())))
+                            .child(col(FragCol::Position, div()).text_xs().text_color(theme::muted_text()).child(place))
                             .child(
-                                div()
-                                    .w(px(70.0))
-                                    .flex_none()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(format!("{} bp", thousands(f.len))),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .overflow_hidden()
-                                    .child(div().text_xs().whitespace_nowrap().child(ends))
-                                    .child(div().text_xs().whitespace_nowrap().text_color(theme::muted_text()).child(place)),
-                            )
-                            .child(
-                                div()
+                                col(FragCol::Open, div())
                                     .id(("fragment-open", i))
-                                    .flex_none()
-                                    .px_2()
-                                    .py(px(2.0))
+                                    .text_center()
+                                    .py(px(1.0))
                                     .rounded_md()
                                     .border_1()
                                     .border_color(theme::border())
@@ -510,7 +472,17 @@ impl RestrictionView {
                     .flex_1()
                     .min_h_0()
                     .child(div().p_2().h_full().flex_none().child(gel))
-                    .child(div().flex().flex_col().flex_1().min_w_0().border_l_1().border_color(theme::border()).child(rows)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .border_l_1()
+                            .border_color(theme::border())
+                            .child(table_header().children(FragCol::ALL.map(|c| col(c, div()).child(c.title()))))
+                            .child(rows),
+                    ),
             )
             .into_any_element()
     }
@@ -533,6 +505,119 @@ impl RestrictionView {
         let features = enzymes::fragment_features(&doc.features, doc.len(), f);
         queue_new_document(NewDocument { stem: stem.to_string(), seq, features, circular: f.circular }, window, cx);
     }
+}
+
+/// A table's columns: a fixed width, or None to share what's left.
+trait Column: Copy {
+    fn width(self) -> Option<f32>;
+    /// Numbers, which line up on the right.
+    fn numeric(self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Col {
+    Check,
+    Name,
+    Site,
+    Ends,
+    Cuts,
+    Star,
+}
+
+impl Col {
+    const ALL: [Col; 6] = [Col::Check, Col::Name, Col::Site, Col::Ends, Col::Cuts, Col::Star];
+
+    fn title(self) -> &'static str {
+        match self {
+            Col::Check | Col::Star => "",
+            Col::Name => "Enzyme",
+            Col::Site => "Site",
+            Col::Ends => "Ends",
+            Col::Cuts => "Cuts",
+        }
+    }
+}
+
+impl Column for Col {
+    fn width(self) -> Option<f32> {
+        match self {
+            Col::Check => Some(12.0),
+            Col::Name => Some(84.0),
+            Col::Site => None,
+            Col::Ends => Some(64.0),
+            Col::Cuts => Some(36.0),
+            Col::Star => Some(14.0),
+        }
+    }
+
+    fn numeric(self) -> bool {
+        self == Col::Cuts
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FragCol {
+    Size,
+    Left,
+    Right,
+    Position,
+    Open,
+}
+
+impl FragCol {
+    const ALL: [FragCol; 5] = [FragCol::Size, FragCol::Left, FragCol::Right, FragCol::Position, FragCol::Open];
+
+    fn title(self) -> &'static str {
+        match self {
+            FragCol::Size => "Size (bp)",
+            FragCol::Left => "Left end",
+            FragCol::Right => "Right end",
+            FragCol::Position => "Position",
+            FragCol::Open => "",
+        }
+    }
+}
+
+impl Column for FragCol {
+    fn width(self) -> Option<f32> {
+        match self {
+            FragCol::Size => Some(64.0),
+            FragCol::Left | FragCol::Right => None,
+            FragCol::Position => Some(104.0),
+            FragCol::Open => Some(44.0),
+        }
+    }
+
+    fn numeric(self) -> bool {
+        matches!(self, FragCol::Size | FragCol::Position)
+    }
+}
+
+/// A cell of column `c`: the same width in the header and every row.
+fn col(c: impl Column, d: gpui::Div) -> gpui::Div {
+    let d = match c.width() {
+        Some(w) => d.w(px(w)).flex_none(),
+        None => d.flex_1().min_w_0(),
+    };
+    d.overflow_hidden().whitespace_nowrap().text_ellipsis().when(c.numeric(), |d| d.text_right())
+}
+
+/// A table row. Full width: a uniform_list otherwise sizes each row to its content
+/// and the flexible columns end in different places.
+fn table_row() -> gpui::Div {
+    div().w_full().flex_none().px_2().flex().flex_row().items_center().gap_2()
+}
+
+fn table_header() -> gpui::Div {
+    table_row()
+        .py(px(3.0))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::muted_text())
+        .border_b_1()
+        .border_color(theme::border())
 }
 
 /// A small tick box.
