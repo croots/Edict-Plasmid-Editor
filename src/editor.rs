@@ -1360,6 +1360,50 @@ pub(crate) fn menu_panel() -> Div {
         .text_color(theme::text())
 }
 
+/// The colour locked bases are boxed in: the scheme's magenta (base16 `base0E`), which
+/// stays clear of the accent the selection and cursor use.
+pub(crate) fn lock_colour() -> Hsla {
+    theme::terminal_palette()[5]
+}
+
+/// Where the lock shimmer is, 0..1, cycling every couple of seconds.
+pub(crate) fn shimmer_phase() -> f32 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32();
+    (t / 2.4).fract()
+}
+
+/// One row's piece of a locked region: a mostly clear box, its outline open where the
+/// region carries on into the next row, and a soft highlight travelling across.
+fn paint_lock_box(b: Bounds<Pixels>, starts: bool, ends: bool, window: &mut Window) {
+    let c = lock_colour();
+    let phase = shimmer_phase();
+    // A gentle breathing in the fill, in step with the sweep.
+    let breathe = 0.5 + 0.5 * (phase * std::f32::consts::TAU).sin();
+    let radius = |on: bool| if on { px(3.0) } else { px(0.0) };
+    let corners = gpui::Corners { top_left: radius(starts), bottom_left: radius(starts), top_right: radius(ends), bottom_right: radius(ends) };
+    let borders = gpui::Edges { top: px(1.0), bottom: px(1.0), left: if starts { px(1.0) } else { px(0.0) }, right: if ends { px(1.0) } else { px(0.0) } };
+    window.paint_quad(gpui::quad(b, corners, c.opacity(0.10 + 0.05 * breathe), borders, c.opacity(0.55 + 0.2 * breathe), gpui::BorderStyle::Solid));
+
+    // The highlight moves in window coordinates, so it lines up from row to row.
+    const PERIOD: f32 = 480.0;
+    const WIDTH: f32 = 64.0;
+    let (x0, x1) = (f32::from(b.origin.x), f32::from(b.origin.x + b.size.width));
+    let mut centre = phase * PERIOD - WIDTH;
+    // Every repeat of the band that reaches this box, in a few soft steps.
+    centre += ((x0 - WIDTH - centre) / PERIOD).ceil() * PERIOD;
+    while centre - WIDTH < x1 {
+        for (half, alpha) in [(WIDTH, 0.05), (WIDTH * 0.6, 0.06), (WIDTH * 0.25, 0.08)] {
+            let (a, z) = ((centre - half).max(x0), (centre + half).min(x1));
+            if a < z {
+                let r = Bounds::new(point(px(a), b.origin.y + px(1.0)), size(px(z - a), b.size.height - px(2.0)));
+                window.paint_quad(fill(r, c.opacity(alpha)));
+            }
+        }
+        centre += PERIOD;
+    }
+}
+
 fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
     let m = ctx.m;
     let bpr = ctx.layout.bases_per_row;
@@ -1383,24 +1427,28 @@ fn paint_row(ctx: &RowCtx, row: usize, bounds: Bounds<Pixels>, hitbox: Hitbox, w
         }
     }
 
-    // Locked bases: a tint behind both strands and a bar above them.
-    for l in ctx.locks.iter() {
-        for (a, b) in l.parts(len) {
-            let (sa, sb) = (a.max(row_start), b.min(row_end));
-            if sa < sb {
-                let (x, w) = (col(sa), (sb - sa) as f32 * m.char_w);
-                window.paint_quad(fill(rect(x, y_top, w, 2.0 * m.line_h), theme::accent().opacity(0.10)));
-                window.paint_quad(fill(rect(x, y_top - 4.0, w, 2.0), theme::accent().opacity(0.8)));
-            }
-        }
-    }
-
     // Strands.
     if row_start < row_end {
         let top = String::from_utf8_lossy(&ctx.seq[row_start..row_end]).into_owned();
         let bottom: String = ctx.seq[row_start..row_end].iter().map(|&b| model::complement(b) as char).collect();
         paint_text(top, ox, y_top, m.font_size, m.line_h, theme::text(), window, cx);
         paint_text(bottom, ox, y_bot, m.font_size, m.line_h, theme::muted_text(), window, cx);
+    }
+
+    // Locked bases: a translucent box over both strands, with a shimmer sweeping across.
+    let mut shimmering = false;
+    for l in ctx.locks.iter() {
+        for (a, b) in l.parts(len) {
+            let (sa, sb) = (a.max(row_start), b.min(row_end));
+            if sa < sb {
+                let (x, w) = (col(sa), (sb - sa) as f32 * m.char_w);
+                paint_lock_box(rect(x - 1.0, y_top - 1.0, w + 2.0, 2.0 * m.line_h + 2.0), sa == a, sb == b, window);
+                shimmering = true;
+            }
+        }
+    }
+    if shimmering {
+        window.request_animation_frame();
     }
 
     // Cursor: a boundary position belongs to the row it starts, except the very end.

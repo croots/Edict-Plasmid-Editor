@@ -445,8 +445,12 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
             if l.wraps() && proj.curved() { vec![(l.start, l.end + geo.len)] } else { l.parts(geo.len) };
         for (s, e) in spans {
             let pts = project(proj, &band(s as f32 * k, e as f32 * k, -LOCK_BAND, LOCK_BAND), true);
-            paint_poly(window, &pts, true, None, false, theme::accent().opacity(0.45));
+            let breathe = 0.5 + 0.5 * (editor::shimmer_phase() * std::f32::consts::TAU).sin();
+            paint_poly(window, &pts, true, None, false, editor::lock_colour().opacity(0.30 + 0.2 * breathe));
         }
+    }
+    if !ctx.locks.is_empty() {
+        window.request_animation_frame();
     }
 
     // Backbone.
