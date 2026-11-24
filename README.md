@@ -9,6 +9,24 @@ nix develop                     # Rust toolchain, Zig 0.17 (for libghostty-vt), 
 cargo run --release -- samples  # explorer root; optional second arg opens a file
 ```
 
+### ESMFold2 (structure prediction, groundwork for a plugin)
+
+`nix/esmfold2.nix` builds Biohub's [`esm`](https://github.com/Biohub/esm) 3.5.0 against nixpkgs'
+ROCm torch (prebuilt on cache.nixos.org; ~5 GB download) and wraps it in `esmfold2-predict`:
+
+```sh
+nix run .#esmfold2 -- -s MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG -o ubq.cif
+nix run .#esmfold2 -- -f chains.fasta -o complex.cif --model biohub/ESMFold2   # each record is a chain
+nix develop .#esmfold2          # Python with `esm` importable
+nix build .#esmfold2-cpu        # torch without ROCm (very slow for a 7B model)
+```
+
+It writes mmCIF (which `src/structure.rs` reads) and prints one JSON object on stdout
+(`ptm`, `iptm`, `plddt_mean`, per-token `plddt`, `seconds`); progress goes to stderr. The weights
+(~26 GB per model, MIT) download from Hugging Face into `$HF_HOME` on first run. The folding trunk
+stays fp32; on ROCm the 6B ESMC language model runs in bf16 rather than esm's default fp8 (RDNA3
+reports capability 11.0, which esm's fp8 check would otherwise accept but cannot run).
+
 ## What it does
 
 - **Explorer** (left): a folder tree showing native `.pgx`, GenBank (`.gb .gbk .genbank .gbff .ape`), FASTA and SnapGene `.dna` files. Click to open. Files are recognised by content first (zip, SnapGene header, `>`), then by extension.

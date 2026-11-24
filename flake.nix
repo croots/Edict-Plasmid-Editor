@@ -46,7 +46,21 @@
             ln -s $out/libexec/zig/zig $out/bin/zig
           '';
         };
+        # ESMFold2 structure prediction, kept out of the default shell: the ROCm
+        # torch closure is several GB. See nix/esmfold2.nix.
+        esmfold2 = import ./nix/esmfold2.nix { inherit pkgs; accel = "rocm"; };
+        esmfold2-cpu = import ./nix/esmfold2.nix { inherit pkgs; accel = "cpu"; };
       in {
+        # `nix run .#esmfold2 -- -s MQIFVKTLTG... -o ubq.cif`
+        packages.esmfold2 = esmfold2.predict;
+        packages.esmfold2-cpu = esmfold2-cpu.predict;
+        apps.esmfold2 = { type = "app"; program = "${esmfold2.predict}/bin/esmfold2-predict"; };
+
+        # `nix develop .#esmfold2`: Python with `esm` importable, plus the CLI.
+        devShells.esmfold2 = pkgs.mkShell {
+          packages = [ esmfold2.env esmfold2.predict ];
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [ rustToolchain pkg-config cmake perl clang mold zig_0_17 ];
           buildInputs = runtimeLibs ++ (with pkgs; [ alsa-lib openssl zstd zlib libgit2 ]);
