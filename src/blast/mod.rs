@@ -96,6 +96,7 @@ impl Program {
     pub fn databases(self) -> &'static [(&'static str, &'static str)] {
         if self.protein_db() {
             &[
+                ("clustered_nr", "ClusteredNR (faster; one hit per cluster)"),
                 ("nr", "Non-redundant protein sequences"),
                 ("refseq_select", "RefSeq Select proteins"),
                 ("refseq_protein", "Reference proteins"),
@@ -807,6 +808,9 @@ impl TaskRunner for BlastRunner {
         let agent = agent();
         let hash = hash(self.query.as_bytes());
         ctx.log(format!("{} of {} bp against {}", o.program.title(), self.query.len(), o.database));
+        if o.database == "nr" {
+            ctx.log("nr is large and searches of it can take a long time; ClusteredNR is usually much faster");
+        }
         if let Some(q) = o.entrez_query() {
             ctx.log(format!("Limited to: {q}"));
         }
@@ -979,7 +983,7 @@ mod tests {
         o.set_program(Program::Blastn);
         assert_eq!((o.word_size, o.scores, o.gaps.as_str(), o.database.as_str()), (11, (2, -3), "5 2", "core_nt"));
         o.set_program(Program::Blastx);
-        assert_eq!((o.database.as_str(), o.composition, o.gaps.as_str()), ("nr", 2, "11 1"));
+        assert_eq!((o.database.as_str(), o.composition, o.gaps.as_str()), ("clustered_nr", 2, "11 1"));
     }
 
     #[test]
