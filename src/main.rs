@@ -3,6 +3,7 @@ mod attach_dialog;
 mod editor;
 mod feature_dialog;
 mod genetic_code;
+mod hotkeys;
 mod layout;
 mod map;
 mod map_layout;

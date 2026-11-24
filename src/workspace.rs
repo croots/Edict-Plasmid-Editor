@@ -11,12 +11,13 @@ use gpui::{
 
 use crate::about::{self, AboutPanel};
 use crate::editor::SeqEditor;
+use crate::hotkeys;
 use crate::panes::{self, PaneGroup};
 use crate::model::{self, Document};
 use crate::settings::{self, Settings};
 use crate::theme::{self, ThemeEntry, ThemeSource};
 
-actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit]);
+actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
 
 /// Bindings handled by the workspace. Ctrl+S / Ctrl+Shift+S stay with the editor's
 /// own key handler; the menu shows them for discoverability.
@@ -39,7 +40,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-\\", panes::SplitDown, None),
         KeyBinding::new("secondary-|", panes::SplitDown, None),
         KeyBinding::new("secondary-shift-w", panes::ClosePane, None),
+        KeyBinding::new("f11", ToggleFullScreen, None),
     ]);
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None)]);
+    }
 }
 
 const SCHEMES_URL: &str = "https://github.com/tinted-theming/schemes";
@@ -74,6 +79,13 @@ struct TreeEntry {
     is_dir: bool,
 }
 
+/// The pages of the Settings panel.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsPage {
+    Appearance,
+    Hotkeys,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ThemeFilter {
     All,
@@ -91,6 +103,7 @@ pub struct Workspace {
     untitled_count: usize,
     menu_open: bool,
     settings_open: bool,
+    settings_page: SettingsPage,
     /// The About panel, while it is open.
     about: Option<Entity<AboutPanel>>,
     settings: Settings,
@@ -118,6 +131,7 @@ impl Workspace {
             untitled_count: 0,
             menu_open: false,
             settings_open: false,
+            settings_page: SettingsPage::Appearance,
             about: None,
             settings: Settings::load(),
             themes: Vec::new(),
@@ -367,6 +381,12 @@ impl Workspace {
         self.settings_open = true;
         window.focus(&self.focus);
         self.scroll_to_current_theme();
+        cx.notify();
+    }
+
+    fn toggle_fullscreen(&mut self, _: &ToggleFullScreen, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        window.toggle_fullscreen();
         cx.notify();
     }
 
@@ -703,6 +723,7 @@ impl Workspace {
             .child(item("m-export", "Export As…", k("⌘E", "Ctrl+E"), has_editor, Box::new(ExportAs)))
             .child(item("m-close", "Close Tab", k("⌘W", "Ctrl+W"), has_tab, Box::new(CloseTab)))
             .child(separator())
+            .child(item("m-fullscreen", "Toggle Full Screen", k("⌃⌘F", "F11"), true, Box::new(ToggleFullScreen)))
             .child(item("m-settings", "Settings…", k("⌘,", "Ctrl+,"), true, Box::new(OpenSettings)))
             .child(item("m-about", "About…", "", true, Box::new(About)))
             .child(separator())
@@ -733,6 +754,29 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.theme_filter = f;
                     this.scroll_to_current_theme();
+                    cx.notify();
+                }))
+        };
+        let page_tab = |id: &'static str, label: &'static str, page: SettingsPage, current: SettingsPage| {
+            let selected = page == current;
+            div()
+                .id(id)
+                .h_full()
+                .flex()
+                .items_center()
+                .px_3()
+                .text_sm()
+                .cursor_pointer()
+                .border_b_2()
+                .border_color(if selected { theme::accent() } else { gpui::transparent_black() })
+                .text_color(if selected { theme::text() } else { theme::muted_text() })
+                .hover(|s| s.text_color(theme::text()))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_page = page;
+                    if page == SettingsPage::Appearance {
+                        this.scroll_to_current_theme();
+                    }
                     cx.notify();
                 }))
         };
@@ -824,7 +868,10 @@ impl Workspace {
                     .px_4()
                     .border_b_1()
                     .border_color(theme::border())
-                    .child(div().flex_1().font_weight(gpui::FontWeight::SEMIBOLD).child("Settings"))
+                    .child(div().font_weight(gpui::FontWeight::SEMIBOLD).mr_4().child("Settings"))
+                    .child(page_tab("page-appearance", "Appearance", SettingsPage::Appearance, self.settings_page))
+                    .child(page_tab("page-hotkeys", "Hotkeys", SettingsPage::Hotkeys, self.settings_page))
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("settings-close")
@@ -837,115 +884,118 @@ impl Workspace {
                             .on_click(cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx))),
                     ),
             )
-            // Theme picker
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_4()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(heading("THEME"))
-                            .child(div().text_xs().text_color(theme::muted_text()).child(format!("· {current_name}")))
-                            .child(div().flex_1())
-                            .child(chip("f-all", "All".into(), ThemeFilter::All, self.theme_filter == ThemeFilter::All))
-                            .child(chip("f-dark", "Dark".into(), ThemeFilter::Dark, self.theme_filter == ThemeFilter::Dark))
-                            .child(chip("f-light", "Light".into(), ThemeFilter::Light, self.theme_filter == ThemeFilter::Light))
-                            .child(chip(
-                                "f-custom",
-                                format!("Custom ({custom_count})"),
-                                ThemeFilter::Custom,
-                                self.theme_filter == ThemeFilter::Custom,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .p_1()
-                            .border_1()
-                            .border_color(theme::border())
-                            .rounded_md()
-                            .child(list)
-                            .when(no_matches, |d| {
-                                d.child(
+            .when(self.settings_page == SettingsPage::Hotkeys, |d| d.child(hotkeys_page()))
+            .when(self.settings_page == SettingsPage::Appearance, |d| {
+                // Theme picker
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .p_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(heading("THEME"))
+                                .child(div().text_xs().text_color(theme::muted_text()).child(format!("· {current_name}")))
+                                .child(div().flex_1())
+                                .child(chip("f-all", "All".into(), ThemeFilter::All, self.theme_filter == ThemeFilter::All))
+                                .child(chip("f-dark", "Dark".into(), ThemeFilter::Dark, self.theme_filter == ThemeFilter::Dark))
+                                .child(chip("f-light", "Light".into(), ThemeFilter::Light, self.theme_filter == ThemeFilter::Light))
+                                .child(chip(
+                                    "f-custom",
+                                    format!("Custom ({custom_count})"),
+                                    ThemeFilter::Custom,
+                                    self.theme_filter == ThemeFilter::Custom,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .p_1()
+                                .border_1()
+                                .border_color(theme::border())
+                                .rounded_md()
+                                .child(list)
+                                .when(no_matches, |d| {
+                                    d.child(
+                                        div()
+                                            .p_2()
+                                            .text_sm()
+                                            .text_color(theme::muted_text())
+                                            .child("No custom themes yet. Add a base16 .yaml file or a folder of them below."),
+                                    )
+                                }),
+                        ),
+                )
+                // Custom base16 sources
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_4()
+                        .pb_4()
+                        .child(heading("CUSTOM BASE16 THEMES"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted_text())
+                                .child("Point at a base16 scheme (.yaml, tinted-theming or original chriskempson layout) or a folder of them."),
+                        )
+                        .children(self.settings.custom_theme_paths.iter().enumerate().map(|(ix, p)| {
+                            let n = self.themes.iter().filter(|t| t.source == ThemeSource::Custom(p.clone())).count();
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .text_sm()
+                                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(p.display().to_string()))
+                                .child(div().text_xs().text_color(theme::muted_text()).child(format!("{n} scheme{}", if n == 1 { "" } else { "s" })))
+                                .child(
                                     div()
-                                        .p_2()
-                                        .text_sm()
+                                        .id(("remove-custom", ix))
+                                        .px_2()
+                                        .rounded_md()
+                                        .cursor_pointer()
                                         .text_color(theme::muted_text())
-                                        .child("No custom themes yet. Add a base16 .yaml file or a folder of them below."),
+                                        .hover(|s| s.bg(theme::hover()))
+                                        .child("×")
+                                        .on_click(cx.listener(move |this, _, window, cx| this.remove_custom_path(ix, window, cx))),
                                 )
-                            }),
-                    ),
-            )
-            // Custom base16 sources
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .px_4()
-                    .pb_4()
-                    .child(heading("CUSTOM BASE16 THEMES"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted_text())
-                            .child("Point at a base16 scheme (.yaml, tinted-theming or original chriskempson layout) or a folder of them."),
-                    )
-                    .children(self.settings.custom_theme_paths.iter().enumerate().map(|(ix, p)| {
-                        let n = self.themes.iter().filter(|t| t.source == ThemeSource::Custom(p.clone())).count();
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .text_sm()
-                            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(p.display().to_string()))
-                            .child(div().text_xs().text_color(theme::muted_text()).child(format!("{n} scheme{}", if n == 1 { "" } else { "s" })))
-                            .child(
-                                div()
-                                    .id(("remove-custom", ix))
-                                    .px_2()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_color(theme::muted_text())
-                                    .hover(|s| s.bg(theme::hover()))
-                                    .child("×")
-                                    .on_click(cx.listener(move |this, _, window, cx| this.remove_custom_path(ix, window, cx))),
-                            )
-                    }))
-                    .children(self.custom_errors.iter().map(|e| div().text_xs().text_color(theme::error()).child(e.clone())))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap_2()
-                            .child(button("add-theme-file", "Add file…").on_click(cx.listener(|this, _, window, cx| this.add_custom_theme(false, window, cx))))
-                            .child(button("add-theme-dir", "Add folder…").on_click(cx.listener(|this, _, window, cx| this.add_custom_theme(true, window, cx))))
-                            .child(button("reload-themes", "Reload").on_click(cx.listener(|this, _, window, cx| {
-                                this.reload_themes();
-                                if let Some(t) = this.themes.iter().find(|t| t.id == this.settings.theme) {
-                                    theme::set(t.theme());
-                                }
-                                window.refresh();
-                                cx.notify();
-                            })))
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id("browse-schemes")
-                                    .text_xs()
-                                    .text_color(theme::accent())
-                                    .cursor_pointer()
-                                    .child("Browse base16 schemes ↗")
-                                    .on_click(|_, _, cx| cx.open_url(SCHEMES_URL)),
-                            ),
-                    ),
-            )
+                        }))
+                        .children(self.custom_errors.iter().map(|e| div().text_xs().text_color(theme::error()).child(e.clone())))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(button("add-theme-file", "Add file…").on_click(cx.listener(|this, _, window, cx| this.add_custom_theme(false, window, cx))))
+                                .child(button("add-theme-dir", "Add folder…").on_click(cx.listener(|this, _, window, cx| this.add_custom_theme(true, window, cx))))
+                                .child(button("reload-themes", "Reload").on_click(cx.listener(|this, _, window, cx| {
+                                    this.reload_themes();
+                                    if let Some(t) = this.themes.iter().find(|t| t.id == this.settings.theme) {
+                                        theme::set(t.theme());
+                                    }
+                                    window.refresh();
+                                    cx.notify();
+                                })))
+                                .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id("browse-schemes")
+                                        .text_xs()
+                                        .text_color(theme::accent())
+                                        .cursor_pointer()
+                                        .child("Browse base16 schemes ↗")
+                                        .on_click(|_, _, cx| cx.open_url(SCHEMES_URL)),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .px_4()
@@ -957,6 +1007,58 @@ impl Workspace {
                     .child(format!("Saved to {config_hint}")),
             )
     }
+}
+
+/// Settings → Hotkeys: every shortcut, grouped by where it applies.
+fn hotkeys_page() -> impl IntoElement {
+    let key_cap = |keys: &'static str| {
+        div()
+            .px_2()
+            .py(px(1.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::panel())
+            .font(crate::editor::editor_font())
+            .text_xs()
+            .whitespace_nowrap()
+            .child(keys)
+    };
+    div()
+        .id("hotkeys")
+        .flex()
+        .flex_col()
+        .gap_4()
+        .p_4()
+        .h(px(470.0))
+        .overflow_y_scroll()
+        .children(hotkeys::GROUPS.iter().map(move |group| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .pb_1()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme::muted_text())
+                        .child(group.title),
+                )
+                .children(group.hotkeys.iter().map(move |h| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_3()
+                        .min_h(px(26.0))
+                        .px_2()
+                        .rounded_md()
+                        .hover(|s| s.bg(theme::hover()))
+                        .child(div().flex_1().text_sm().child(h.description))
+                        .child(key_cap(h.keys()))
+                }))
+        }))
 }
 
 /// A row of small color chips: the backgrounds, the foreground, then the accents.
@@ -1019,6 +1121,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_about))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::toggle_fullscreen))
             .child(self.sidebar(cx))
             .child(
                 div()
