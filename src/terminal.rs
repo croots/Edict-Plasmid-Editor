@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use ghostty_vt::key::{self, Key, Mods};
 use ghostty_vt::render::{CellIterator, CursorVisualStyle, RowIterator};
 use ghostty_vt::screen::{CellWide, Screen};
-use ghostty_vt::style::{RgbColor, Underline};
+use ghostty_vt::style::{Palette, RgbColor, Underline};
 use ghostty_vt::terminal::{ColorScheme, ScrollViewport};
 use ghostty_vt::{Event, RenderState, Terminal, TerminalOptions};
 use gpui::{
@@ -31,6 +31,7 @@ use crate::theme;
 pub const KEY_CONTEXT: &str = "Terminal";
 
 const PAD: f32 = 6.0;
+const DEFAULT_FONT: f32 = 13.0;
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 32.0;
 
@@ -67,7 +68,9 @@ pub struct TerminalView {
     /// Why there is no shell: it exited, or could not start.
     status: Option<String>,
     /// The theme colors last handed to the terminal as its defaults.
-    theme_colors: Option<(Hsla, Hsla)>,
+    theme_colors: Option<ThemeColors>,
+    /// libghostty's own 256 colors, kept for indexes 16–255 (the cube and greys).
+    builtin_palette: Option<Palette>,
     /// Take keyboard focus on the first frame, so a new pane is ready to type in.
     focus_pending: bool,
     _reader: Option<Task<()>>,
@@ -89,11 +92,12 @@ impl TerminalView {
             cwd,
             focus: cx.focus_handle(),
             grid,
-            font_size: 13.0,
+            font_size: DEFAULT_FONT,
             scroll_rem: 0.0,
             title: String::new(),
             status: None,
             theme_colors: None,
+            builtin_palette: None,
             focus_pending: true,
             _reader: None,
         };
@@ -222,17 +226,30 @@ impl TerminalView {
 
     /// Hand the app theme to the terminal as its default colors, when it changed.
     fn sync_theme(&mut self) {
-        let colors = (theme::editor_bg(), theme::text());
-        if self.theme_colors == Some(colors) {
+        let colors = ThemeColors {
+            bg: theme::editor_bg(),
+            fg: theme::text(),
+            cursor: theme::cursor(),
+            ansi: theme::terminal_palette(),
+        };
+        if self.theme_colors.as_ref() == Some(&colors) {
             return;
         }
-        self.theme_colors = Some(colors);
-        let (bg, fg) = colors;
-        self.term.set_default_bg_color(Some(to_rgb(bg))).ok();
-        self.term.set_default_fg_color(Some(to_rgb(fg))).ok();
-        self.term.set_default_cursor_color(Some(to_rgb(theme::cursor()))).ok();
+        if self.builtin_palette.is_none() {
+            self.builtin_palette = self.term.default_color_palette().ok();
+        }
+        if let Some(mut palette) = self.builtin_palette {
+            for (slot, color) in palette.0.iter_mut().zip(colors.ansi) {
+                *slot = to_rgb(color);
+            }
+            self.term.set_default_color_palette(Some(palette)).ok();
+        }
+        self.term.set_default_bg_color(Some(to_rgb(colors.bg))).ok();
+        self.term.set_default_fg_color(Some(to_rgb(colors.fg))).ok();
+        self.term.set_default_cursor_color(Some(to_rgb(colors.cursor))).ok();
         // Answers programs asking whether to draw for a light or dark background.
-        self.term.set_color_scheme(Some(if bg.l < 0.5 { ColorScheme::Dark } else { ColorScheme::Light }));
+        self.term.set_color_scheme(Some(if colors.bg.l < 0.5 { ColorScheme::Dark } else { ColorScheme::Light }));
+        self.theme_colors = Some(colors);
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -255,14 +272,18 @@ impl TerminalView {
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let m = ks.modifiers;
-        // A few shortcuts of our own, on Ctrl+Shift so plain Ctrl keys reach the shell.
-        if m.control && m.shift {
+        // Zoom: Ctrl+= or Ctrl++ larger, Ctrl+- smaller, Ctrl+0 back to the default size.
+        if m.control && !m.alt && !m.platform {
             match ks.key.as_str() {
-                "v" => return self.paste(cx),
                 "=" | "+" => return self.zoom(1.0, cx),
                 "-" | "_" => return self.zoom(-1.0, cx),
+                "0" if !m.shift => return self.zoom(DEFAULT_FONT - self.font_size, cx),
                 _ => {}
             }
+        }
+        // Paste is on Ctrl+Shift so plain Ctrl+V reaches the shell.
+        if m.control && m.shift && ks.key == "v" {
+            return self.paste(cx);
         }
         if m.shift && !m.control && !m.alt {
             let page = self.grid.1.saturating_sub(1).max(1) as isize;
@@ -457,6 +478,15 @@ impl Focusable for TerminalView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
+}
+
+/// The app theme colors last handed to the terminal.
+#[derive(PartialEq)]
+struct ThemeColors {
+    bg: Hsla,
+    fg: Hsla,
+    cursor: Hsla,
+    ansi: [Hsla; 16],
 }
 
 /// How a run of cells is drawn.
@@ -753,6 +783,19 @@ mod tests {
         assert_eq!((bg.start, bg.end), (0, 2));
         let (x, y, _, _) = frame.cursor.expect("cursor");
         assert_eq!((x, y), (3, 1));
+    }
+
+    #[test]
+    fn ansi_colors_follow_the_palette() {
+        let mut t = term(10, 2);
+        t.vt_write(b"\x1b[31mr");
+        let mut palette = t.default_color_palette().unwrap();
+        palette.0[1] = RgbColor { r: 0x12, g: 0x34, b: 0x56 };
+        // Set after the text was written, as when the user switches themes.
+        t.set_default_color_palette(Some(palette)).unwrap();
+        let (_, frame) = screen(&t);
+        let r = frame.runs.iter().find(|r| r.text == "r").unwrap();
+        assert_eq!(to_rgb(r.look.fg), RgbColor { r: 0x12, g: 0x34, b: 0x56 });
     }
 
     #[test]

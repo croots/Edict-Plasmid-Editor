@@ -40,6 +40,9 @@ pub struct Theme {
     /// Candidate label colors for feature bars; the one contrasting best with the fill wins.
     pub feature_text_dark: Hsla,
     pub feature_text_light: Hsla,
+    /// The terminal's sixteen ANSI colors: black, red, green, yellow, blue, magenta,
+    /// cyan, white, then their bright variants.
+    pub terminal: [Hsla; 16],
 }
 
 thread_local! {
@@ -67,6 +70,7 @@ pub fn ruler() -> Hsla { get(|t| t.ruler) }
 pub fn cursor() -> Hsla { get(|t| t.cursor) }
 pub fn selection() -> Hsla { get(|t| t.selection) }
 pub fn error() -> Hsla { get(|t| t.error) }
+pub fn terminal_palette() -> [Hsla; 16] { get(|t| t.terminal) }
 
 pub fn feature(kind: &str) -> Hsla {
     let ix = match kind {
@@ -144,6 +148,12 @@ impl Theme {
             .map(c),
             feature_text_dark: c(0x1d2330),
             feature_text_light: c(0xffffff),
+            // Readable on white: "white" is a light grey, so text in it stays visible.
+            terminal: [
+                0x1d2330, 0xc62828, 0x2e7d32, 0x9a6700, 0x2f6fdf, 0x8e44ad, 0x00838f, 0x9aa1ad, 0x6b7280, 0xe53935, 0x43a047,
+                0xb58900, 0x4a8af0, 0xa55ec7, 0x0097a7, 0xc9ced6,
+            ]
+            .map(c),
         }
     }
 
@@ -183,6 +193,11 @@ impl Theme {
             ],
             feature_text_dark: if luminance(b[0x00]) < luminance(b[0x07]) { b[0x00] } else { b[0x07] },
             feature_text_light: if luminance(b[0x00]) < luminance(b[0x07]) { b[0x07] } else { b[0x00] },
+            // The base16 terminal mapping (as in base16-shell and tinted-terminal).
+            terminal: [
+                0x00, 0x08, 0x0B, 0x0A, 0x0D, 0x0E, 0x0C, 0x05, 0x03, 0x08, 0x0B, 0x0A, 0x0D, 0x0E, 0x0C, 0x07,
+            ]
+            .map(|i| b[i]),
         }
     }
 }
