@@ -1,3 +1,4 @@
+mod about;
 mod attach_dialog;
 mod editor;
 mod feature_dialog;
@@ -14,6 +15,7 @@ mod snapgene;
 mod structure;
 mod structure_render;
 mod structure_view;
+mod terminal;
 mod text_input;
 mod theme;
 mod workspace;

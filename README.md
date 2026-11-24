@@ -5,7 +5,7 @@ Proof of concept for a Benchling-style plasmid editor built on [GPUI](https://cr
 ## Run
 
 ```sh
-nix develop                     # Rust toolchain + GPUI's Vulkan/Wayland/X11/font libraries
+nix develop                     # Rust toolchain, Zig 0.17 (for libghostty-vt), GPUI's Vulkan/Wayland/X11/font libraries
 cargo run --release -- samples  # explorer root; optional second arg opens a file
 ```
 
@@ -16,7 +16,7 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
 - **Sequence map**: double-stranded wrapped rows, a ruler (ticks every 10, labels every 50) and feature lanes packed per row, with strand arrows. The rows are a virtualized `gpui::list` with variable heights, so the 48 kb lambda genome scrolls smoothly.
 - **Editing**: click or drag to select, Shift+click to extend, and click a feature bar to select it. Type `A C G T N…` (any IUPAC code) to insert or replace, and use Backspace/Delete to remove. Features shift and resize with edits.
 - **Keys**: Ctrl+Z/Ctrl+Shift+Z undo/redo, Ctrl+C/X/V clipboard (pasted text is filtered to bases), Ctrl+Shift+C copies the reverse complement, Ctrl+A selects all, Ctrl+S saves (GenBank keeps qualifiers), Ctrl+=/− zoom, arrows/Home/End/PageUp/PageDown to move.
-- **Split panes**: each tab has its own pane layout. Split the active pane right (Ctrl+\\) or down (Ctrl+Shift+\\), or use the buttons in a pane's header. Splits nest. Drag the bar between two panes to resize them. Drag a pane by its header onto another pane to move it: drop near an edge to dock it on that side (left, right, top, bottom), or in the middle to swap the two. A highlight shows where it will land. Close a pane with its `×` or Ctrl+Shift+W. The sequence pane always stays open. New panes open a map.
+- **Split panes**: each tab has its own pane layout. Split the active pane right (Ctrl+\\) or down (Ctrl+Shift+\\), or use the buttons in a pane's header. Splits nest. Drag the bar between two panes to resize them. Drag a pane by its header onto another pane to move it: drop near an edge to dock it on that side (left, right, top, bottom), or in the middle to swap the two. A highlight shows where it will land. Close a pane with its `×` or Ctrl+Shift+W. The sequence pane always stays open. The split button's menu picks what the new pane shows: a map, a terminal or a 3D structure; the keyboard shortcuts open a map.
 - **DNA map**: features drawn with [SBOL Visual](https://sbolstandard.org/visual-glyphs/) glyphs, either **Circular** or **Linear** per pane (the toggle in the pane header; a new map follows the file's topology).
   - Glyphs: CDS, promoter, RBS, terminator, origin of replication, origin of transfer, primer binding site, operator, insulator, recombination site, polyA, ncRNA, engineered region, and "no glyph assigned". `regulatory` features use their `/regulatory_class`.
   - Placement: baseline glyphs (promoter, RBS, terminator, …) sit on the backbone and centered ones (CDS, origin, …) straddle it. Reverse-strand glyphs are rotated 180°. Overlaps stack into lanes, outward for the forward strand and inward for the reverse.
@@ -25,7 +25,8 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
   - Sequence-record annotations (`variation`, `conflict`, `old_sequence`, …) are left off the map but still appear in the sequence pane.
   - Clicking a glyph selects the feature, scrolls the sequence to it and names it in the status bar. Clicking or dragging along the backbone sets the cursor or a selection. The selection and cursor are shared with the sequence pane.
 - **Status bar**: length, topology, cursor position or selection range and length, and GC% of the selection.
-- **Menu** (☰, top left of the explorer): New File (Ctrl+N), Open File… (Ctrl+O), Open Folder… (Ctrl+Shift+O), Save (Ctrl+S), Save As… (Ctrl+Shift+S), Export As… (Ctrl+E), Close Tab (Ctrl+W), Settings… (Ctrl+,), Quit (Ctrl+Q; asks first if files are unsaved). New files are in memory until their first save, which asks where to put them. The extension you pick (`.pgx`, `.gb` or `.fa`) sets the format; a name without one becomes `.pgx`. Export As writes a copy in any writable format while the tab keeps editing the original.
+- **Terminal pane**: your `$SHELL` in the open file's folder, emulated by [libghostty-vt](https://lib.ghostty.org/vt/) (Ghostty's terminal core) on a pty from `portable-pty`. It follows the app theme, sets `TERM=xterm-ghostty` with Ghostty's terminfo, and shows the shell's title in the pane header. While it has focus, Ctrl+W/E/N/O/Q/\\ and Escape go to the shell; the Ctrl+Shift shortcuts still work. Ctrl+Shift+V pastes (bracketed when the program asks), Ctrl+Shift+= / − zoom, the wheel or Shift+PageUp/PageDown scroll the scrollback (full-screen programs get arrow keys). When the shell exits, Enter starts a new one. Mouse reporting and text selection are not done yet.
+- **Menu** (☰, top left of the explorer): New File (Ctrl+N), Open File… (Ctrl+O), Open Folder… (Ctrl+Shift+O), Save (Ctrl+S), Save As… (Ctrl+Shift+S), Export As… (Ctrl+E), Close Tab (Ctrl+W), Settings… (Ctrl+,), About… (version and third-party licenses), Quit (Ctrl+Q; asks first if files are unsaved). New files are in memory until their first save, which asks where to put them. The extension you pick (`.pgx`, `.gb` or `.fa`) sets the format; a name without one becomes `.pgx`. Export As writes a copy in any writable format while the tab keeps editing the original.
 - **Saving other formats**: Ctrl+S on a GenBank, FASTA or SnapGene file asks first. **Convert** writes `name.pgx` beside the original, leaves the original untouched and switches the tab to the new file. **Keep** saves in the original format and warns what is lost: edit history for GenBank, plus features and topology for FASTA. Keep is not offered for SnapGene, which is read-only. The choice lasts for the tab. Choosing a format by name in Save As counts as a choice and does not ask.
 - **Settings → Theme**: the built-in light palette plus every base16 scheme from [tinted-theming/schemes](https://github.com/tinted-theming/schemes) (the successor to `chriskempson/base16-schemes-source`), with swatches and Dark/Light/Custom filters. Clicking applies it live.
 - **Settings → Custom base16 themes**: add a scheme `.yaml` file or a folder of them. Both the current tinted-theming layout (`palette: { base00: "#…" }`) and the original chriskempson layout (`base00: "…"`) parse. Reload picks up edits. Settings are kept in `$XDG_CONFIG_HOME/plasmid-gpui/settings.conf` (`~/.config/…` by default).
@@ -39,11 +40,14 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
 | `src/snapgene.rs` | Read-only SnapGene `.dna` import (sequence, topology, features, primers, notes). Unit-tested. |
 | `src/layout.rs` | Pure wrapping and lane packing in base units. Unit-tested. |
 | `src/editor.rs` | GPUI view: paints rows with `canvas`, hit-testing, keyboard. |
-| `src/panes.rs` | Per-tab split tree: leaves are the sequence view or a map, splits hold an axis and a ratio, the dividers drag to resize, and headers drag to move panes. |
+| `src/panes.rs` | Per-tab split tree: leaves are the sequence view, a map, a 3D structure or a terminal, splits hold an axis and a ratio, the dividers drag to resize, and headers drag to move panes. |
 | `src/sbol.rs` | SBOL Visual glyphs: GenBank feature key → glyph, and each glyph's outline in a local box. Unit-tested. |
 | `src/map_layout.rs` | Pure placement of glyphs along a backbone, with lanes that wrap the origin on circular maps. Unit-tested. |
 | `src/map.rs` | GPUI map view: linear/circular projection, painting, labels, click and drag. |
 | `src/workspace.rs` | Explorer tree, tab strip, active editor, hamburger menu, settings panel. |
+| `src/terminal.rs` | Terminal pane: pty and reader thread, libghostty-vt render state painted as a cell grid, key encoding, scrollback. Unit-tested. |
+| `src/about.rs` | About panel: version, third-party notices and the crate license table. |
+| `licenses/` | License texts shown in About. `rust-crates.tsv` lists every linked Rust crate; regenerate it with `scripts/licenses.sh` after changing dependencies. |
 | `src/theme.rs` | Active theme (thread-local), base16 → UI color mapping, YAML scheme parser, bundled and custom theme loading. Unit-tested. |
 | `src/settings.rs` | Load and save the settings file. |
 | `themes/base16/` | The bundled schemes (MIT, tinted-theming/schemes). `build.rs` embeds every `.yaml` here into the binary, so to update them copy a newer `base16/` folder over this one. |

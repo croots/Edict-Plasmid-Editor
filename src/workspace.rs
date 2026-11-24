@@ -9,27 +9,33 @@ use gpui::{
     PathPromptOptions, PromptLevel, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
 };
 
+use crate::about::{self, AboutPanel};
 use crate::editor::SeqEditor;
 use crate::panes::{self, PaneGroup};
 use crate::model::{self, Document};
 use crate::settings::{self, Settings};
 use crate::theme::{self, ThemeEntry, ThemeSource};
 
-actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, Dismiss, Quit]);
+actions!(plasmid, [NewFile, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit]);
 
 /// Bindings handled by the workspace. Ctrl+S / Ctrl+Shift+S stay with the editor's
 /// own key handler; the menu shows them for discoverability.
+///
+/// Keys a shell needs (Ctrl+W, Ctrl+E, Ctrl+\, Escape, ...) go to a focused terminal
+/// instead; the Ctrl+Shift ones stay global.
 pub fn bind_keys(cx: &mut App) {
+    // On macOS these are Cmd keys, which a shell never sees.
+    let app = if cfg!(target_os = "macos") { None } else { Some("!Terminal") };
     cx.bind_keys([
-        KeyBinding::new("secondary-n", NewFile, None),
-        KeyBinding::new("secondary-o", OpenFile, None),
+        KeyBinding::new("secondary-n", NewFile, app),
+        KeyBinding::new("secondary-o", OpenFile, app),
         KeyBinding::new("secondary-shift-o", OpenFolder, None),
-        KeyBinding::new("secondary-e", ExportAs, None),
-        KeyBinding::new("secondary-w", CloseTab, None),
+        KeyBinding::new("secondary-e", ExportAs, app),
+        KeyBinding::new("secondary-w", CloseTab, app),
         KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("escape", Dismiss, None),
-        KeyBinding::new("secondary-\\", panes::SplitRight, None),
+        KeyBinding::new("secondary-q", Quit, app),
+        KeyBinding::new("escape", Dismiss, Some("!Terminal")),
+        KeyBinding::new("secondary-\\", panes::SplitRight, app),
         KeyBinding::new("secondary-shift-\\", panes::SplitDown, None),
         KeyBinding::new("secondary-|", panes::SplitDown, None),
         KeyBinding::new("secondary-shift-w", panes::ClosePane, None),
@@ -85,6 +91,8 @@ pub struct Workspace {
     untitled_count: usize,
     menu_open: bool,
     settings_open: bool,
+    /// The About panel, while it is open.
+    about: Option<Entity<AboutPanel>>,
     settings: Settings,
     /// Built-in and bundled themes, then those loaded from `settings.custom_theme_paths`.
     themes: Vec<ThemeEntry>,
@@ -110,6 +118,7 @@ impl Workspace {
             untitled_count: 0,
             menu_open: false,
             settings_open: false,
+            about: None,
             settings: Settings::load(),
             themes: Vec::new(),
             custom_errors: Vec::new(),
@@ -361,10 +370,21 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu_open = false;
+        self.settings_open = false;
+        let panel = cx.new(|_| AboutPanel::new());
+        cx.subscribe_in(&panel, window, |this, _, _: &about::Close, window, cx| this.dismiss(&Dismiss, window, cx)).detach();
+        self.about = Some(panel);
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu_open || self.settings_open {
+        if self.menu_open || self.settings_open || self.about.is_some() {
             self.menu_open = false;
             self.settings_open = false;
+            self.about = None;
             self.refocus_editor(window, cx);
         }
         self.notice = None;
@@ -684,6 +704,7 @@ impl Workspace {
             .child(item("m-close", "Close Tab", k("⌘W", "Ctrl+W"), has_tab, Box::new(CloseTab)))
             .child(separator())
             .child(item("m-settings", "Settings…", k("⌘,", "Ctrl+,"), true, Box::new(OpenSettings)))
+            .child(item("m-about", "About…", "", true, Box::new(About)))
             .child(separator())
             .child(item("m-quit", "Quit", k("⌘Q", "Ctrl+Q"), true, Box::new(Quit)))
     }
@@ -985,6 +1006,7 @@ impl Render for Workspace {
             .size_full()
             .bg(theme::app_bg())
             .text_color(theme::text())
+            .key_context("Workspace")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
@@ -994,6 +1016,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export_as))
             .on_action(cx.listener(Self::close_active))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_about))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::quit))
             .child(self.sidebar(cx))
@@ -1055,6 +1078,22 @@ impl Render for Workspace {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx)))
                         .child(self.settings_panel(cx)),
+                )
+            })
+            .when_some(self.about.clone(), |d, panel| {
+                d.child(
+                    div()
+                        .id("about-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p_6()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.dismiss(&Dismiss, window, cx)))
+                        .child(panel),
                 )
             })
     }

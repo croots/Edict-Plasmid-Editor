@@ -23,9 +23,32 @@
           libx11 libxcb libxcursor libxi libxrandr
           fontconfig freetype
         ];
+        # The terminal pane links libghostty-vt, which ghostty-vt-sys builds from its
+        # pinned source with exactly Zig 0.17 (nixpkgs stops at 0.16). The official
+        # tarball is a static binary, so it runs unpatched.
+        zigTarballs = {
+          x86_64-linux = { arch = "x86_64"; sha256 = "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"; };
+          aarch64-linux = { arch = "aarch64"; sha256 = "a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795"; };
+        };
+        zig_0_17 = pkgs.stdenvNoCC.mkDerivation rec {
+          pname = "zig";
+          version = "0.17.1";
+          src = pkgs.fetchurl {
+            url = "https://ziglang.org/download/${version}/zig-${zigTarballs.${system}.arch}-linux-${version}.tar.xz";
+            inherit (zigTarballs.${system}) sha256;
+          };
+          dontConfigure = true;
+          dontBuild = true;
+          dontFixup = true;
+          installPhase = ''
+            mkdir -p $out/bin $out/libexec
+            cp -r . $out/libexec/zig
+            ln -s $out/libexec/zig/zig $out/bin/zig
+          '';
+        };
       in {
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ rustToolchain pkg-config cmake perl clang mold ];
+          nativeBuildInputs = with pkgs; [ rustToolchain pkg-config cmake perl clang mold zig_0_17 ];
           buildInputs = runtimeLibs ++ (with pkgs; [ alsa-lib openssl zstd zlib libgit2 ]);
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";

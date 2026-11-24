@@ -17,6 +17,7 @@ use gpui::{
 use crate::editor::{EditorEvent, SeqEditor};
 use crate::map::{DnaMap, MapMode};
 use crate::structure_view::StructureView;
+use crate::terminal::TerminalView;
 use crate::theme;
 
 actions!(plasmid, [SplitRight, SplitDown, ClosePane]);
@@ -74,6 +75,7 @@ enum PaneView {
     Sequence,
     Map(Entity<DnaMap>),
     Structure(Entity<StructureView>),
+    Terminal(Entity<TerminalView>),
 }
 
 enum Node {
@@ -189,6 +191,8 @@ enum NewPane {
     Map,
     /// A 3D structure pane, showing this structure if given.
     Structure(Option<String>),
+    /// A shell in the document's folder.
+    Terminal,
 }
 
 /// The dropdown of the split button that was clicked.
@@ -255,6 +259,14 @@ impl PaneGroup {
                 }
                 v
             })),
+            NewPane::Terminal => {
+                let doc_dir = self.editor.read(cx).doc.path.parent().map(|p| p.to_path_buf());
+                let cwd = doc_dir.filter(|p| p.is_dir()).or_else(|| std::env::current_dir().ok()).unwrap_or_default();
+                let term = cx.new(|cx| TerminalView::new(cwd, cx));
+                // Title changes from the shell show in the pane header.
+                cx.observe(&term, |_, _, cx| cx.notify()).detach();
+                PaneView::Terminal(term)
+            }
         };
         let (leaf_id, split_id) = (self.next_id, self.next_id + 1);
         self.next_id += 2;
@@ -325,6 +337,7 @@ impl PaneGroup {
                 cx.notify();
             }))
             .child(item(("split-map", 0), "Map".into(), NewPane::Map))
+            .child(item(("split-terminal", 0), "Terminal".into(), NewPane::Terminal))
             .child(div().h(px(1.0)).my_1().bg(theme::border()));
         if structures.is_empty() {
             list = list.child(item(("split-3d", 0), "3D Structure".into(), NewPane::Structure(None)));
@@ -516,6 +529,9 @@ impl PaneGroup {
 
     fn render_leaf(&self, id: usize, view: &PaneView, cx: &mut Context<Self>) -> AnyElement {
         let active = self.active == id && matches!(self.root, Node::Split { .. });
+        // No tooltips while the split dropdown is open: without a builder GPUI also
+        // drops any tooltip that is already showing or pending.
+        let menu_open = self.split_menu.is_some();
         let icon_button = |key: &'static str, tip: &'static str, icon: AnyElement| {
             div()
                 .id((key, id))
@@ -527,7 +543,7 @@ impl PaneGroup {
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::hover()))
                 .child(icon)
-                .tooltip(move |_, cx| cx.new(|_| TextTooltip(tip.into())).into())
+                .when(!menu_open, |d| d.tooltip(move |_, cx| cx.new(|_| TextTooltip(tip.into())).into()))
         };
         let icon_color = theme::muted_text();
         let split_icon = |axis: Axis| {
@@ -550,6 +566,10 @@ impl PaneGroup {
             PaneView::Sequence => "SEQUENCE".into(),
             PaneView::Map(_) => "MAP".into(),
             PaneView::Structure(_) => "STRUCTURE".into(),
+            PaneView::Terminal(t) => match t.read(cx).title() {
+                "" => "TERMINAL".into(),
+                title => format!("TERMINAL · {title}").into(),
+            },
         };
         let mut header = div()
             .id(("pane-header", id))
@@ -636,6 +656,7 @@ impl PaneGroup {
             PaneView::Sequence => self.editor.clone().into_any_element(),
             PaneView::Map(map) => map.clone().into_any_element(),
             PaneView::Structure(s) => s.clone().into_any_element(),
+            PaneView::Terminal(t) => t.clone().into_any_element(),
         };
 
         let cell = self.leaf_bounds.clone();
@@ -699,6 +720,7 @@ impl Render for PaneGroup {
             let title = match self.root.view(d.leaf) {
                 Some(PaneView::Sequence) => "SEQUENCE",
                 Some(PaneView::Structure(_)) => "STRUCTURE",
+                Some(PaneView::Terminal(_)) => "TERMINAL",
                 _ => "MAP",
             };
             let hint = match d.target.map(|t| t.1) {
