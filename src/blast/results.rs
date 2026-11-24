@@ -44,6 +44,11 @@ impl Column {
         }
     }
 
+    /// Numbers, which line up on the right.
+    pub fn numeric(self) -> bool {
+        !matches!(self, Column::Description | Column::Organism | Column::Accession)
+    }
+
     /// The order a first click sorts in: best first.
     pub fn default_ascending(self) -> bool {
         matches!(self, Column::Description | Column::Organism | Column::Evalue | Column::Accession)
@@ -253,20 +258,77 @@ pub fn segments(lock: &Lock, lo: usize, hi: usize, len: usize) -> Vec<(usize, us
     if len == 0 || hi < lo || lo == 0 {
         return Vec::new();
     }
-    let a = (lock.start + lo - 1) % len;
-    let n = hi - lo + 1;
+    span_segments((lock.start + lo - 1) % len, hi - lo + 1, len)
+}
+
+/// `n` bases from `a` in a sequence `len` long, split at the origin if they wrap.
+fn span_segments(a: usize, n: usize, len: usize) -> Vec<(usize, usize)> {
     let mut segs = if a + n <= len { vec![(a, a + n)] } else { vec![(a, len), (0, a + n - len)] };
     segs.sort_unstable();
     segs
 }
 
+/// Grow a coding span (`n` bases from `a`) by the codon just past its end when that
+/// codon is a stop, so the feature ends the way a CDS does. Past the ends of a linear
+/// sequence there is nothing to read; a circular one carries on across the origin.
+pub fn with_stop(seq: &[u8], circular: bool, a: usize, n: usize, strand: i8, table: u8) -> (usize, usize) {
+    let len = seq.len();
+    if len == 0 || n + 3 > len {
+        return (a, n);
+    }
+    let code = crate::genetic_code::Code::get(table).unwrap_or(&crate::genetic_code::CODES[0]);
+    let base = |i: usize| seq[i % len].to_ascii_uppercase();
+    if strand >= 0 {
+        let after = a + n;
+        if !circular && after + 3 > len {
+            return (a, n);
+        }
+        let codon = [base(after), base(after + 1), base(after + 2)];
+        if code.amino_acid(codon) == b'*' {
+            return (a, n + 3);
+        }
+    } else {
+        if !circular && a < 3 {
+            return (a, n);
+        }
+        // The three bases before the span, read on the minus strand.
+        let start = (a + len - 3) % len;
+        let comp = |i: usize| crate::model::complement(base(i));
+        let codon = [comp(start + 2), comp(start + 1), comp(start)];
+        if code.amino_acid(codon) == b'*' {
+            return (start, n + 3);
+        }
+    }
+    (a, n)
+}
+
 /// The feature a match describes: where it is in the sequence, which way it runs,
 /// and qualifiers saying where it came from. `date` is YYYY-MM-DD.
-pub fn draft(results: &BlastResults, hit: &Hit, hsp: &Hsp, lock: &Lock, len: usize, author: Option<&str>, date: &str) -> FeatureDraft {
+pub fn draft(
+    results: &BlastResults,
+    hit: &Hit,
+    hsp: &Hsp,
+    lock: &Lock,
+    seq: &[u8],
+    circular: bool,
+    author: Option<&str>,
+    date: &str,
+) -> FeatureDraft {
     let program = results.options.program;
+    let len = seq.len();
     let (lo, hi) = hsp.query_span();
-    let segments = segments(lock, lo, hi, len);
     let strand = hsp.strand();
+    let mut segments = segments(lock, lo, hi, len);
+    let mut with_stop_codon = false;
+    // A protein match ends at the last amino acid; the CDS takes in a stop right after it.
+    if program == Program::Blastx && len > 0 && lo > 0 && hi >= lo {
+        let (a, n) = ((lock.start + lo - 1) % len, hi - lo + 1);
+        let (a2, n2) = with_stop(seq, circular, a, n, strand, results.options.genetic_code);
+        if n2 != n {
+            segments = span_segments(a2, n2, len);
+            with_stop_codon = true;
+        }
+    }
     let acc = hit.accession_version();
     let title = hit.title();
     let name = short_title(&title);
@@ -300,6 +362,9 @@ pub fn draft(results: &BlastResults, hit: &Hit, hsp: &Hsp, lock: &Lock, len: usi
         crate::editor::thousands(hsp.align_len),
         format_evalue(hsp.evalue)
     ));
+    if with_stop_codon {
+        note.push_str(" Includes the stop codon after the match.");
+    }
     qualifiers.push(("note".to_string(), note));
     FeatureDraft { segments, strand, kind: kind.into(), name, qualifiers }
 }
@@ -419,7 +484,8 @@ mod tests {
             bases_hash: 0,
         };
         let lock = Lock { id: 1, start: 100, end: 900 };
-        let d = draft(&results, &h, &h.hsps[0], &lock, 5000, Some("Ada"), "2026-11-23");
+        let mut seq = vec![b'A'; 5000];
+        let d = draft(&results, &h, &h.hsps[0], &lock, &seq, false, Some("Ada"), "2026-11-23");
         assert_eq!(d.segments, vec![(103, 823)]);
         assert_eq!((d.kind.as_str(), d.strand, d.name.as_str()), ("CDS", 1, "thr operon leader peptide"));
         let q = |k: &str| d.qualifiers.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
@@ -430,5 +496,25 @@ mod tests {
             "Identified by BLASTX against nr on 2026-11-23 by Ada: thr operon leader peptide [Escherichia coli str. K-12 \
              substr. MG1655] (NP_414542.1), Escherichia coli str. K-12 substr. MG1655, 98.8% identity over 240 aa, E-value 3e-150."
         );
+
+        // A stop codon right after the match joins the CDS.
+        seq[823..826].copy_from_slice(b"taa");
+        let d = draft(&results, &h, &h.hsps[0], &lock, &seq, false, Some("Ada"), "2026-11-23");
+        assert_eq!(d.segments, vec![(103, 826)]);
+        assert!(d.qualifiers.iter().any(|(k, v)| k == "note" && v.ends_with("Includes the stop codon after the match.")));
+    }
+
+    #[test]
+    fn stop_codons() {
+        // Plus strand: TGA right after bases 0..6.
+        assert_eq!(with_stop(b"ATGAAATGACCC", false, 0, 6, 1, 1), (0, 9));
+        assert_eq!(with_stop(b"ATGAAACCCCCC", false, 0, 6, 1, 1), (0, 6));
+        // Minus strand: TTA before the span reads TAA on the other strand.
+        assert_eq!(with_stop(b"CCCTTACATTTT", false, 6, 6, -1, 1), (3, 9));
+        // Linear: nothing past the end; circular: on across the origin.
+        assert_eq!(with_stop(b"TAGCCCATGAAA", false, 6, 6, 1, 1), (6, 6));
+        assert_eq!(with_stop(b"TAGCCCATGAAA", true, 6, 6, 1, 1), (6, 9));
+        // Table 4 reads TGA as Trp, not a stop.
+        assert_eq!(with_stop(b"ATGAAATGACCC", false, 0, 6, 1, 4), (0, 6));
     }
 }

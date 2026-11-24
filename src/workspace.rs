@@ -140,6 +140,31 @@ impl Workspace {
             }
         })
         .detach();
+        // A task that finishes while the window is behind others gets a desktop notification.
+        cx.subscribe_in(&tasks::manager(cx), window, |_this: &mut Self, m, ev: &tasks::TaskEvent, window, cx| {
+            let tasks::TaskEvent::Finished(id) = *ev;
+            if window.is_window_active() {
+                return;
+            }
+            let Some(t) = m.read(cx).task(id) else { return };
+            let (summary, body) = match &t.status {
+                TaskStatus::Failed(e) => (format!("{} failed", t.kind), format!("{}: {e}", t.title)),
+                _ => {
+                    let found = t.output.clone().and_then(|o| o.downcast::<crate::blast::BlastResults>().ok()).map(|r| match r.hits.len() {
+                        0 => "no matches".to_string(),
+                        1 => "1 match".to_string(),
+                        n => format!("{n} matches"),
+                    });
+                    let body = match found {
+                        Some(f) => format!("{}: {f}", t.title),
+                        None => t.title.clone(),
+                    };
+                    (format!("{} finished", t.kind), body)
+                }
+            };
+            crate::notify::send(summary, body);
+        })
+        .detach();
         let _tasks = cx.observe_in(&tasks::manager(cx), window, |this: &mut Self, m, window, cx| {
             let front = m.read(cx).foreground;
             if front != this.shown_task {
@@ -733,6 +758,7 @@ impl Workspace {
                     _ => theme::muted_text(),
                 };
                 let front = m.foreground == Some(id);
+                let unseen = t.unseen && !front;
                 div()
                     .id(("task", id as usize))
                     .flex()
@@ -743,6 +769,7 @@ impl Workspace {
                     .py_1()
                     .cursor_pointer()
                     .when(front, |d| d.bg(theme::active()))
+                    .when(unseen, |d| d.bg(theme::accent().opacity(0.16)).border_l_2().border_color(theme::accent()).pl(px(10.0)))
                     .hover(|s| s.bg(theme::hover()))
                     .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(colour).flex_none())
                     .child(
@@ -751,16 +778,25 @@ impl Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().overflow_hidden().whitespace_nowrap().text_ellipsis().child(format!("{}: {}", t.kind, t.title)))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .when(unseen, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(format!("{}: {}", t.kind, t.title)),
+                            )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(theme::muted_text())
+                                    .text_color(if unseen { theme::accent() } else { theme::muted_text() })
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .child(match (&t.status, &t.progress) {
                                         (TaskStatus::Running, Some(p)) => p.clone(),
+                                        (s, _) if unseen => format!("{} · new", s.label()),
                                         (s, _) => s.label().to_string(),
                                     }),
                             ),

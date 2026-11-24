@@ -39,7 +39,7 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
   - **Results** are a table sortable by any column (E-value first): description, organism, max/total score, query cover, E-value, identity, length and accession. Click a hit to see its alignments drawn NCBI-style, 60 columns of Query/midline/Sbjct, with nucleotide coordinates stepping by 3 and the frame for translated searches. Links open the record and the full NCBI report.
   - **Create feature from match…** opens the usual Create Feature dialog filled in:
     - span and strand from the match (split at the origin if needed)
-    - `CDS` with `/product`, `/codon_start` and `/transl_table` for BLASTX, otherwise `misc_feature`
+    - `CDS` with `/product`, `/codon_start` and `/transl_table` for BLASTX, otherwise `misc_feature`; a BLASTX CDS takes in the stop codon right after the match, read with that genetic code
     - `/inference` naming the accession
     - an editable `/note`: "Identified by BLASTX against nr on 2026-11-23 by ‹author›: …, 98.8% identity over 240 aa, E-value 3e-150."
 
@@ -49,7 +49,7 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
   - Typing, deleting, pasting, cutting, undo/redo and reverts that would change them are refused, with a note in the status bar.
   - Edits elsewhere move the lock with the bases, and reindexing rotates it. Features can still be edited.
   - Clicking locked bases (or the band on a map) brings their task forward; where locks overlap, a menu asks which. A drag that starts outside still selects through them.
-- **Tasks** (bottom of the explorer): running, queued and finished tasks. Click one to show it (its file's tab comes forward too). `×` cancels a running task and clears a finished one. Escape sends the shown task to the background. Closing a tab or quitting asks first if tasks would be lost.
+- **Tasks** (bottom of the explorer): running, queued and finished tasks. Click one to show it (its file's tab comes forward too). `×` cancels a running task and clears a finished one. Escape sends the shown task to the background. A task that finishes out of view is highlighted until you open it, and if the window isn't focused a desktop notification says so. Closing a tab or quitting asks first if tasks would be lost.
 - **Menu** (☰, top left of the explorer): New File (Ctrl+N), Open File… (Ctrl+O), Open Folder… (Ctrl+Shift+O), Save (Ctrl+S), Save As… (Ctrl+Shift+S), Export As… (Ctrl+E), Close Tab (Ctrl+W), Toggle Full Screen (F11; also ⌃⌘F on macOS), Settings… (Ctrl+,), About… (version and third-party licenses), Quit (Ctrl+Q; asks first if files are unsaved). New files are in memory until their first save, which asks where to put them. The extension you pick (`.pgx`, `.gb` or `.fa`) sets the format; a name without one becomes `.pgx`. Export As writes a copy in any writable format while the tab keeps editing the original.
 - **Settings** (Ctrl+,): the **Appearance** page picks a theme and adds custom base16 schemes; the **Hotkeys** page lists every keyboard and mouse shortcut, grouped by where it applies (general, panes, sequence editor, terminal, 3D structure); the **Keys** page holds the email address BLAST sends to NCBI (with `tool=plasmid-gpui`), as NCBI's usage rules ask. BLAST won't run without it.
 - **Saving other formats**: Ctrl+S on a GenBank, FASTA or SnapGene file asks first. **Convert** writes `name.pgx` beside the original, leaves the original untouched and switches the tab to the new file. **Keep** saves in the original format and warns what is lost: edit history for GenBank, plus features and topology for FASTA. Keep is not offered for SnapGene, which is read-only. The choice lasts for the tab. Choosing a format by name in Save As counts as a choice and does not ask.
@@ -72,6 +72,7 @@ cargo run --release -- samples  # explorer root; optional second arg opens a fil
 | `src/workspace.rs` | Explorer tree, tab strip, active editor, hamburger menu, settings panel. |
 | `src/terminal.rs` | Terminal pane: pty and reader thread, libghostty-vt render state painted as a cell grid, key encoding, scrollback. Unit-tested. |
 | `src/history.rs` | History pane: the change log grouped by save, each save's net effect (found by replaying the log backwards), finding where an old change is in the current sequence, and the right-click reverts. Unit-tested. |
+| `src/notify.rs` | Desktop notifications (D-Bus on Linux, `osascript` on macOS) for tasks that finish while the window is in the background. |
 | `src/tasks.rs` | Background tasks, shared by built-in features and, later, plugins: a runner on its own thread, per-service limits (one at a time for NCBI) with a FIFO queue, a log, cancelling, region locks and which task is in front. Unit-tested. |
 | `src/locks.rs` | Locked regions: how edits move them, which edits they refuse, and rotation on reindex. Unit-tested. |
 | `src/blast/mod.rs` | The NCBI BLAST URL API: options and their per-program defaults, the Put form, RID/status parsing, JSON2_S results, request throttling. Unit-tested; `cargo test live_search -- --ignored` with `BLAST_EMAIL` set runs a real search. |

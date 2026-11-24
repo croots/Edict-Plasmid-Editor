@@ -11,6 +11,7 @@ mod locks;
 mod map;
 mod map_layout;
 mod model;
+mod notify;
 mod panes;
 mod pgx;
 mod sbol;

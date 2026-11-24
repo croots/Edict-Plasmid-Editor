@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Result};
-use gpui::{AnyView, App, AppContext as _, Context, Entity, Global, WeakEntity};
+use gpui::{AnyView, App, AppContext as _, Context, Entity, EventEmitter, Global, WeakEntity};
 
 use crate::editor::SeqEditor;
 
@@ -99,6 +99,8 @@ pub struct Task {
     pub finished_at: Option<SystemTime>,
     /// A region of the editor's sequence is locked under this task's id.
     pub locks: bool,
+    /// Finished while out of view, and not looked at since: the sidebar picks it out.
+    pub unseen: bool,
     service: &'static str,
     runner: Option<Box<dyn TaskRunner>>,
     cancel: Arc<AtomicBool>,
@@ -197,6 +199,14 @@ pub fn manager(cx: &App) -> Entity<TaskManager> {
     cx.global::<GlobalTasks>().0.clone()
 }
 
+/// What the manager announces, beyond "something changed".
+pub enum TaskEvent {
+    /// A task finished on its own (done or failed, not cancelled).
+    Finished(TaskId),
+}
+
+impl EventEmitter<TaskEvent> for TaskManager {}
+
 impl TaskManager {
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
@@ -240,6 +250,7 @@ impl TaskManager {
             output: None,
             finished_at: None,
             locks: false,
+            unseen: false,
             service: "",
             runner: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -357,6 +368,7 @@ impl TaskManager {
     }
 
     fn finish(&mut self, id: TaskId, result: std::result::Result<Output, String>, cx: &mut Context<Self>) {
+        let in_view = self.foreground == Some(id);
         let Some(t) = self.task_mut(id) else { return };
         let cancelled = t.cancel.load(Ordering::Relaxed);
         t.finished_at = Some(SystemTime::now());
@@ -375,10 +387,17 @@ impl TaskManager {
                 t.status = TaskStatus::Failed(e);
             }
         }
+        let stopped = matches!(t.status, TaskStatus::Cancelled);
+        if !stopped {
+            t.unseen = !in_view;
+        }
         if !matches!(t.status, TaskStatus::Done) {
             self.release(id, cx);
         }
         self.pump(cx);
+        if !stopped {
+            cx.emit(TaskEvent::Finished(id));
+        }
         cx.notify();
     }
 
@@ -432,7 +451,8 @@ impl TaskManager {
     }
 
     pub fn bring_forward(&mut self, id: TaskId, cx: &mut Context<Self>) {
-        if self.task(id).is_some() {
+        if let Some(t) = self.task_mut(id) {
+            t.unseen = false;
             self.foreground = Some(id);
             cx.notify();
         }

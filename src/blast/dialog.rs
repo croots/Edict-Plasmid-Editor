@@ -190,7 +190,7 @@ impl BlastView {
             }
             let (Some(h), Some(p)) = (res.hits.get(hit), res.hits.get(hit).and_then(|h| h.hsps.get(hsp))) else { return };
             let author = settings::shared().effective_author();
-            results::draft(&res, h, p, &lock, doc.len(), author.as_deref(), &super::date(finished))
+            results::draft(&res, h, p, &lock, &doc.seq, doc.circular, author.as_deref(), &super::date(finished))
         };
         manager.update(cx, |m, cx| m.background(cx));
         editor.update(cx, |ed, cx| {
@@ -436,10 +436,11 @@ impl BlastView {
             _ => Some(64.0),
         };
         let cell = move |c: Column, d: Div| match width(c) {
+            Some(w) if c.numeric() => d.w(px(w)).flex_none().text_right(),
             None => d.flex_1().min_w_0(),
             Some(w) => d.w(px(w)).flex_none(),
         };
-        let header = div().flex().flex_row().gap_2().px_2().py_1().border_b_1().border_color(theme::border()).children(
+        let header = div().w_full().flex().flex_row().items_end().gap_2().px_2().py_1().border_b_1().border_color(theme::border()).children(
             Column::ALL.iter().enumerate().map(|(i, &c)| {
                 let arrow = if c == by { if asc { " ▲" } else { " ▼" } } else { "" };
                 cell(c, div())
@@ -448,8 +449,6 @@ impl BlastView {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if c == by { theme::text() } else { theme::muted_text() })
                     .cursor_pointer()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
                     .child(format!("{}{arrow}", c.title()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sort = if this.sort.0 == c { (c, !this.sort.1) } else { (c, c.default_ascending()) };
@@ -461,13 +460,14 @@ impl BlastView {
         let list = uniform_list(
             "blast-hits",
             order.len(),
-            cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                 range
                     .map(|row| {
                         let ix = order[row];
                         let hit = &res2.hits[ix];
                         div()
                             .id(("hit", ix))
+                            .w_full()
                             .flex()
                             .flex_row()
                             .gap_2()
@@ -477,6 +477,7 @@ impl BlastView {
                             .text_xs()
                             .cursor_pointer()
                             .when(row % 2 == 1, |d| d.bg(theme::app_bg()))
+                            .when(this.open == Some(ix), |d| d.bg(theme::active()))
                             .hover(|s| s.bg(theme::hover()))
                             .children(Column::ALL.iter().map(|&c| {
                                 cell(c, div()).overflow_hidden().whitespace_nowrap().text_ellipsis().child(c.cell(hit, res2.query_len))
