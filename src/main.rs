@@ -22,6 +22,7 @@ mod sbol;
 mod settings;
 mod tasks;
 mod snapgene;
+mod dssp;
 mod structure;
 mod structure_render;
 mod structure_view;

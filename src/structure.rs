@@ -2,7 +2,8 @@
 //! viewer draws, and linking protein chains to the CDS features that encode them.
 //!
 //! Only what a viewer needs is read: the first model's atoms (first alternate location
-//! only, waters dropped), residues, chains and the author's secondary structure. Links
+//! only, waters dropped), residues, chains and the author's secondary structure (worked
+//! out from the backbone, by `dssp`, when the file has none). Links
 //! are recomputed from sequences rather than stored, so they survive edits: a chain is
 //! tied to whichever CDS its residues align to best.
 
@@ -433,6 +434,8 @@ fn build(raw: Raw) -> Molecule {
             _ => list.push((a.res_name.clone(), a.seq_num, a.icode, vec![a])),
         }
     }
+    // Amino acids' N, CA, C, O, for working out secondary structure the file leaves out.
+    let mut backbone: Vec<(usize, usize, crate::dssp::Backbone)> = Vec::new();
     let mut chain_ids: Vec<(String, usize)> = chain_ix.into_iter().collect();
     chain_ids.sort_by_key(|(_, ix)| *ix);
     for ((id, _), residues) in chain_ids.into_iter().zip(per_chain) {
@@ -463,6 +466,12 @@ fn build(raw: Raw) -> Molecule {
                 // the middle one sits closest to where the chain runs.
                 let cas: Vec<usize> = atoms.iter().enumerate().filter(|(_, a)| a.name.starts_with("CA")).map(|(i, _)| a0 + i).collect();
                 trace = cas.get(cas.len() / 2).copied().or_else(|| atoms.iter().position(|a| a.name == "C4'").map(|i| a0 + i));
+            }
+            if polymer {
+                let find = |n: &str| atoms.iter().find(|a| a.name == n).map(|a| a.pos);
+                if let (Some(n), Some(ca), Some(c), Some(o)) = (find("N"), find("CA"), find("C"), find("O")) {
+                    backbone.push((ri, ci, [n, ca, c, o]));
+                }
             }
             let letters = if polymer { one_letter(&name).unwrap_or("X").to_string() } else { String::new() };
             mol.residues.push(Residue {
@@ -495,6 +504,12 @@ fn build(raw: Raw) -> Molecule {
             if key == *end {
                 break;
             }
+        }
+    }
+    if raw.ss.is_empty() {
+        let input: Vec<(usize, crate::dssp::Backbone)> = backbone.iter().map(|&(_, ci, bb)| (ci, bb)).collect();
+        for ((ri, _, _), ss) in backbone.iter().zip(crate::dssp::assign(&input)) {
+            mol.residues[*ri].ss = ss;
         }
     }
     mol
