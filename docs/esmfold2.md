@@ -51,3 +51,12 @@ It writes mmCIF (which `src/structure.rs` reads) and prints one JSON object on s
 (~26 GB per model, MIT) download from Hugging Face into `$HF_HOME` on first run. The folding trunk
 stays fp32; on ROCm the 6B ESMC language model runs in bf16 rather than esm's default fp8 (RDNA3
 reports capability 11.0, which esm's fp8 check would otherwise accept but cannot run).
+
+## Citing
+
+If you publish results from this plugin, cite ESMFold2 (the plugin's result card shows
+this, with a Copy button):
+
+> Candido S, Hayes T, Derry A, et al. Language Modeling Materializes a World Model of
+> Protein Biology. bioRxiv 2026.06.03.729735 (2026).
+> [doi:10.64898/2026.06.03.729735](https://doi.org/10.64898/2026.06.03.729735)

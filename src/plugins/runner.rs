@@ -12,6 +12,7 @@ use anyhow::{bail, Context as _, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Deserialize;
 
+use crate::model::FeatureRecord;
 use crate::tasks::{Output, TaskCtx, TaskRunner};
 use crate::terminal::{pump_reader, PtyHandoff, TerminalView};
 
@@ -55,21 +56,49 @@ impl Scratch {
 
 /// What a plugin's run gave back.
 pub struct PluginOutput {
-    pub data: Vec<u8>,
-    /// "mmcif" or "pdb".
-    pub format: String,
-    /// The protein chains, in input order ("A").
-    pub chains: Vec<String>,
-    /// For the structure's Source ("ESMFold2-Fast, seed 0").
+    pub result: Produced,
+    /// Where it came from: the structure's Source ("ESMFold2-Fast, seed 0"), or the
+    /// tool that found the features ("pLannotate v2.0.0").
     pub source: Option<String>,
     /// Shown on the result card: (label, value), e.g. ("pTM", 0.84).
     pub metrics: Vec<(String, f64)>,
-    /// Per-residue confidence, 0–100, if the plugin gave one.
-    pub plddt: Vec<f32>,
     pub elapsed: Duration,
     /// Keeps the run's folder until the result is dropped.
     #[allow(dead_code)]
     pub workdir: Arc<Scratch>,
+}
+
+/// The result itself, of the kind the action's `output` names.
+pub enum Produced {
+    Structure {
+        data: Vec<u8>,
+        /// "mmcif" or "pdb".
+        format: String,
+        /// The protein chains, in input order ("A").
+        chains: Vec<String>,
+        /// Per-residue confidence, 0–100, if the plugin gave one.
+        plddt: Vec<f32>,
+    },
+    /// Features in the coordinates of the bases sent (0 is the region's first base).
+    Features(Vec<ProposedFeature>),
+}
+
+/// A feature a plugin found, which the user may add.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProposedFeature {
+    /// `type`, `label`, `strand`, `segments` and `qualifiers`, as in the edit log.
+    #[serde(flatten)]
+    pub record: FeatureRecord,
+    /// One line shown under it ("snapgene · 99.8% identity").
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Whether it starts ticked.
+    #[serde(default = "yes")]
+    pub selected: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -95,7 +124,10 @@ enum Event {
 #[derive(Deserialize)]
 struct ResultEvent {
     kind: String,
-    file: String,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    features: Vec<ProposedFeature>,
     #[serde(default = "mmcif")]
     format: String,
     #[serde(default)]
@@ -117,6 +149,8 @@ pub struct PluginRunner {
     pub env_argv: Vec<OsString>,
     pub script: PathBuf,
     pub request: serde_json::Value,
+    /// The result kind the action promises: "structure" or "features".
+    pub output: String,
     /// Keeps the run's folder until the result is dropped.
     #[allow(dead_code)]
     pub workdir: Arc<Scratch>,
@@ -299,32 +333,34 @@ impl TaskRunner for PluginRunner {
             }
         }
         let Some(r) = result else { bail!("the plugin finished without giving a result") };
-        if r.kind != "structure" {
-            bail!("the plugin gave a {:?} result; this version only takes structures", r.kind);
+        if r.kind != self.output {
+            bail!("the plugin gave a {:?} result, but its action promises {:?}", r.kind, self.output);
         }
-        let format = r.format.to_ascii_lowercase();
-        if !matches!(format.as_str(), "mmcif" | "pdb") {
-            bail!("the plugin gave a structure as {:?}; expected mmcif or pdb", r.format);
-        }
-        let file = dir.join(&r.file);
-        let inside = file.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(f, d)| f.starts_with(d));
-        if !inside {
-            bail!("the result file {:?} isn't in the run's folder", r.file);
-        }
-        let data = std::fs::read(&file).with_context(|| format!("reading the result {}", r.file))?;
-        self.check_structure(&data, &format)?;
+        let produced = match r.kind.as_str() {
+            "structure" => {
+                let format = r.format.to_ascii_lowercase();
+                if !matches!(format.as_str(), "mmcif" | "pdb") {
+                    bail!("the plugin gave a structure as {:?}; expected mmcif or pdb", r.format);
+                }
+                let Some(name) = r.file.as_deref() else { bail!("the plugin's structure result names no file") };
+                let file = dir.join(name);
+                let inside = file.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(f, d)| f.starts_with(d));
+                if !inside {
+                    bail!("the result file {name:?} isn't in the run's folder");
+                }
+                let data = std::fs::read(&file).with_context(|| format!("reading the result {name}"))?;
+                self.check_structure(&data, &format)?;
+                Produced::Structure { data, format, chains: r.chains, plddt: r.plddt }
+            }
+            "features" => {
+                self.check_features(&r.features)?;
+                Produced::Features(r.features)
+            }
+            other => bail!("the plugin gave a {other:?} result, which this version doesn't take"),
+        };
         let metrics = r.metrics.iter().filter_map(|(k, v)| v.as_f64().map(|v| (k.clone(), v))).collect();
         ctx.log(format!("Finished in {:.1} s", elapsed.as_secs_f64()));
-        Ok(Arc::new(PluginOutput {
-            data,
-            format,
-            chains: r.chains,
-            source: r.source,
-            metrics,
-            plddt: r.plddt,
-            elapsed,
-            workdir: self.workdir.clone(),
-        }))
+        Ok(Arc::new(PluginOutput { result: produced, source: r.source, metrics, elapsed, workdir: self.workdir.clone() }))
     }
 }
 
@@ -341,6 +377,42 @@ impl PluginRunner {
             let (id, seq) = (s["id"].as_str().unwrap_or("?"), s["seq"].as_str().unwrap_or_default());
             if !chains.iter().any(|c| c == seq.to_ascii_uppercase().as_bytes()) {
                 bail!("the plugin's structure has no chain matching protein {id} ({} aa) as sent", seq.len());
+            }
+        }
+        Ok(())
+    }
+
+    /// Every feature must lie within the bases sent, in the edit log's form: segments
+    /// `[start, end)` in forward order (through the origin once, if the bases were
+    /// sent as circular), a strand of -1, 0 or 1, and a type.
+    fn check_features(&self, features: &[ProposedFeature]) -> Result<()> {
+        let sent = &self.request["input"]["sequences"][0];
+        let len = sent["seq"].as_str().map_or(0, str::len);
+        let circular = sent["circular"].as_bool().unwrap_or(false);
+        for (i, p) in features.iter().enumerate() {
+            let f = &p.record;
+            let which = || format!("feature {} ({} {:?})", i + 1, f.kind, f.label);
+            if f.kind.trim().is_empty() {
+                bail!("the plugin's feature {} has no type", i + 1);
+            }
+            if !(-1..=1).contains(&f.strand) {
+                bail!("{}: strand {} isn't -1, 0 or 1", which(), f.strand);
+            }
+            if f.segments.is_empty() {
+                bail!("{}: no segments", which());
+            }
+            let (first, mut last, mut wrapped) = (f.segments[0][0], 0, false);
+            for &[s, e] in &f.segments {
+                if s < last && circular && !wrapped {
+                    wrapped = true;
+                } else if s < last {
+                    bail!("{}: segment [{s}, {e}) isn't in order within the {len} bases sent", which());
+                }
+                // Past the origin, it mustn't run back into its own start.
+                if s >= e || e > len || (wrapped && e > first) {
+                    bail!("{}: segment [{s}, {e}) isn't in order within the {len} bases sent", which());
+                }
+                last = e;
             }
         }
         Ok(())
@@ -373,6 +445,10 @@ mod tests {
     }
 
     fn run_with(script: &str, request: serde_json::Value, cancel_after: Option<Duration>) -> (Result<Output>, Vec<String>) {
+        run_for("structure", script, request, cancel_after)
+    }
+
+    fn run_for(output: &str, script: &str, request: serde_json::Value, cancel_after: Option<Duration>) -> (Result<Output>, Vec<String>) {
         let tmp = std::env::temp_dir().join(format!("edict-plugin-test-{}-{}", std::process::id(), rand_suffix()));
         std::fs::create_dir_all(tmp.join(".edict")).unwrap();
         let path = tmp.join("plugin.py");
@@ -387,6 +463,7 @@ mod tests {
             env_argv: vec![py.into()],
             script: path,
             request,
+            output: output.into(),
             workdir: Arc::new(Scratch(tmp)),
             pty_tx,
             grid: (80, 24),
@@ -456,10 +533,11 @@ edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], me
             return;
         }
         let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
-        assert!(out.data.starts_with(b"data_mkv"));
-        assert_eq!(out.chains, vec!["A"]);
+        let Produced::Structure { data, chains, plddt, .. } = &out.result else { panic!("not a structure") };
+        assert!(data.starts_with(b"data_mkv"));
+        assert_eq!(chains, &vec!["A"]);
         assert_eq!(out.metrics, vec![("ptm".to_string(), 0.8)]);
-        assert_eq!(out.plddt, vec![90.0, 80.0, 70.0]);
+        assert_eq!(plddt, &vec![90.0, 80.0, 70.0]);
         assert!(msgs.iter().any(|m| m == "(Folding · 50%)"), "{msgs:?}");
         let dir = out.workdir.path().to_path_buf();
         drop(out);
@@ -509,8 +587,70 @@ edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], me
             return;
         }
         let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
-        assert_eq!(out.chains, vec!["A"]);
+        assert!(matches!(&out.result, Produced::Structure { chains, .. } if chains == &vec!["A"]));
         assert!(out.source.as_deref().is_some_and(|s| s.contains("1.5")));
+    }
+
+    fn run_features(script: &str) -> (Result<Output>, Vec<String>) {
+        let request = serde_json::json!({"api": 1, "input": {"sequences": [{"id": "dna", "seq": "ACGTACGTAC", "circular": false}]}});
+        run_for("features", script, request, None)
+    }
+
+    #[test]
+    fn a_plugin_gives_features() {
+        let script = r#"
+import edict
+edict.result(kind="features", source="Toy 1", features=[
+    {"type": "promoter", "label": "P1", "strand": 1, "segments": [[0, 4]], "qualifiers": [["note", "strong"]], "detail": "99% identity"},
+    {"type": "CDS", "label": "orf", "strand": -1, "segments": [[2, 5], [6, 10]], "selected": False},
+])
+"#;
+        let (out, msgs) = run_features(script);
+        if msgs == ["skipped"] {
+            return;
+        }
+        let out = out.unwrap_or_else(|e| panic!("{e:#}")).downcast::<PluginOutput>().ok().unwrap();
+        let Produced::Features(fs) = &out.result else { panic!("not features") };
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].record.qualifiers, vec![("note".to_string(), Some("strong".to_string()))]);
+        assert_eq!(fs[0].detail.as_deref(), Some("99% identity"));
+        assert!(fs[0].selected && !fs[1].selected);
+        assert_eq!(fs[1].record.segments, vec![[2, 5], [6, 10]]);
+        assert_eq!(out.source.as_deref(), Some("Toy 1"));
+    }
+
+    #[test]
+    fn bad_features_are_refused() {
+        let give = |f: &str| format!("import edict\nedict.result(kind='features', features=[{f}])\n");
+        for (f, why) in [
+            ("{'type': 'CDS', 'label': 'x', 'segments': [[0, 11]]}", "within the 10 bases"),
+            ("{'type': 'CDS', 'label': 'x', 'segments': [[4, 4]]}", "within the 10 bases"),
+            ("{'type': 'CDS', 'label': 'x', 'segments': [[5, 8], [0, 2]]}", "in order"),
+            ("{'type': 'CDS', 'label': 'x', 'segments': []}", "no segments"),
+            ("{'type': '', 'label': 'x', 'segments': [[0, 2]]}", "no type"),
+            ("{'type': 'CDS', 'label': 'x', 'strand': 2, 'segments': [[0, 2]]}", "strand"),
+        ] {
+            let (out, msgs) = run_features(&give(f));
+            if msgs == ["skipped"] {
+                return;
+            }
+            let e = out.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(e.contains(why), "{f}: {e}");
+        }
+        // Through the origin only on circular DNA, and only once.
+        let across = "{'type': 'rep_origin', 'label': 'ori', 'segments': [[8, 10], [0, 2]]}";
+        let (out, _) = run_features(&give(across));
+        assert!(out.is_err());
+        let request = serde_json::json!({"api": 1, "input": {"sequences": [{"id": "dna", "seq": "ACGTACGTAC", "circular": true}]}});
+        let (out, _) = run_for("features", &give(across), request.clone(), None);
+        assert!(out.is_ok());
+        let twice = "{'type': 'x', 'label': 'x', 'segments': [[8, 10], [0, 2], [1, 3]]}";
+        assert!(run_for("features", &give(twice), request.clone(), None).0.is_err());
+        let overlapping = "{'type': 'x', 'label': 'x', 'segments': [[5, 10], [0, 7]]}";
+        assert!(run_for("features", &give(overlapping), request, None).0.is_err());
+        // A structure where features were promised.
+        let (out, _) = run_features("import edict\nedict.result(kind='structure', file='x.cif')\n");
+        assert!(out.err().unwrap().to_string().contains("promises"));
     }
 
     #[test]

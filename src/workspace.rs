@@ -177,6 +177,12 @@ impl Workspace {
                     });
                     let found = found.or_else(|| {
                         let o = t.output.clone()?.downcast::<crate::plugins::runner::PluginOutput>().ok()?;
+                        if let crate::plugins::runner::Produced::Features(fs) = &o.result {
+                            return Some(match fs.len() {
+                                1 => "1 feature found".to_string(),
+                                n => format!("{n} features found"),
+                            });
+                        }
                         let metrics: Vec<String> = o.metrics.iter().map(|(k, v)| format!("{k} {v:.2}")).collect();
                         Some(if metrics.is_empty() { "structure ready".to_string() } else { format!("structure ready · {}", metrics.join(" · ")) })
                     });
@@ -1420,6 +1426,7 @@ impl Workspace {
                     )
                     .children(p.manifest.description.clone().map(|d| div().text_xs().child(d)))
                     .when(!actions.is_empty(), |d| d.child(small(format!("Offers: {}", actions.join(", ")))))
+                    .children(p.manifest.citations.iter().map(|c| small(format!("Cite: {}", c.full()))))
                     .child(status)
                     .child(envs),
             );

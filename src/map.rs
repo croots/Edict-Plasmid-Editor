@@ -3,6 +3,10 @@
 //! The map reads the document and selection straight from the tab's `SeqEditor`
 //! and re-renders whenever it changes. Clicking a glyph selects that feature in the
 //! editor; clicking or dragging along the backbone sets the cursor or a range.
+//!
+//! [`preview`] draws the same map from a plain list of features, not tied to an
+//! editor, for showing what something would add (a plugin's features, say) before
+//! it is added.
 
 use std::cell::Cell;
 use std::f32::consts::TAU;
@@ -25,6 +29,18 @@ const LANE_GAP: f32 = 6.0;
 const LABEL_SIZE: f32 = 11.0;
 const LABEL_LINE: f32 = 14.0;
 const PAD: f32 = 28.0;
+
+/// How a feature is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Tone {
+    /// As the document's own map draws it.
+    #[default]
+    Normal,
+    /// Background for other features: faint, with a muted label.
+    Faded,
+    /// Offered but not chosen: faint, with a dashed outline.
+    Unchosen,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapMode {
@@ -327,6 +343,11 @@ impl Geo {
     }
 
     fn hit(&self, u: f32, v: f32) -> Option<&Placed> {
+        self.hit_where(u, v, |_| true)
+    }
+
+    /// The smallest glyph at `(u, v)` among the features `keep` allows.
+    fn hit_where(&self, u: f32, v: f32, keep: impl Fn(usize) -> bool) -> Option<&Placed> {
         let c = self.circumference();
         let along = |it: &Placed| {
             let inside = |u: f32| u >= it.u0 - 2.0 && u <= it.u0 + it.w + 2.0;
@@ -340,7 +361,7 @@ impl Geo {
             .placement
             .items
             .iter()
-            .filter(|it| along(it))
+            .filter(|it| keep(it.feature) && along(it))
             .filter(|it| {
                 let (lo, hi) = self.v_range(it);
                 v >= lo - 2.0 && v <= hi + 2.0
@@ -455,9 +476,32 @@ struct PaintCtx {
     geo: Rc<Geo>,
     name: String,
     selection: Selection,
-    cursor: usize,
+    /// Drawn when nothing is selected.
+    cursor: Option<usize>,
     focused: bool,
     locks: Rc<Vec<Lock>>,
+    /// Per feature; missing ones are [`Tone::Normal`].
+    tones: Rc<Vec<Tone>>,
+    /// Drawn as if selected.
+    marked: Option<usize>,
+}
+
+impl PaintCtx {
+    fn tone(&self, feature: usize) -> Tone {
+        self.tones.get(feature).copied().unwrap_or_default()
+    }
+
+    fn selected(&self, it: &Placed) -> bool {
+        self.marked == Some(it.feature) || self.selection.matches_extent(it.start, it.end, self.geo.len)
+    }
+
+    fn label_colour(&self, it: &Placed) -> Hsla {
+        match (self.selected(it), self.tone(it.feature)) {
+            (true, _) => theme::cursor(),
+            (false, Tone::Normal) => theme::text(),
+            (false, _) => theme::muted_text(),
+        }
+    }
 }
 
 fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -509,8 +553,18 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
     let outline = theme::text();
     let highlight = theme::cursor();
     for it in &geo.placement.items {
-        let color = theme::feature(it.glyph.color_kind());
-        let selected = sel.matches_extent(it.start, it.end, geo.len);
+        let tone = ctx.tone(it.feature);
+        let full = theme::feature(it.glyph.color_kind());
+        let color = match tone {
+            Tone::Normal => full,
+            Tone::Faded => full.opacity(0.22),
+            Tone::Unchosen => full.opacity(0.3),
+        };
+        let selected = ctx.selected(it);
+        let outline = match tone {
+            Tone::Normal => outline,
+            _ => theme::muted_text().opacity(0.6),
+        };
         // Point glyphs are narrower than long features; show the true extent on the backbone.
         if matches!(it.glyph.sizing(), Sizing::Point { .. }) && it.span.1 - it.span.0 > it.w + 2.0 {
             let b = geo.base_v(it);
@@ -525,7 +579,8 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
             match s.paint {
                 Paint::Outline => {
                     paint_poly(window, &pts, true, None, false, color);
-                    paint_poly(window, &pts, true, Some(if selected { 2.0 } else { 1.0 }), false, edge);
+                    let dashed = tone == Tone::Unchosen && !selected;
+                    paint_poly(window, &pts, true, Some(if selected { 2.0 } else { 1.0 }), dashed, edge);
                 }
                 Paint::Fill => paint_poly(window, &pts, true, None, false, if selected { highlight } else { color }),
                 Paint::Stroke => paint_poly(window, &pts, s.closed, Some(2.0), false, if selected { highlight } else { color }),
@@ -533,7 +588,7 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
             }
         }
         if geo.mode == MapMode::Linear {
-            paint_linear_label(geo, it, &geo.labels[it.feature], proj, selected, window, cx);
+            paint_linear_label(geo, it, &geo.labels[it.feature], proj, ctx.label_colour(it), window, cx);
         }
     }
 
@@ -570,15 +625,15 @@ fn paint_map(ctx: &PaintCtx, proj: &Proj, bounds: Bounds<Pixels>, window: &mut W
     }
 
     // Cursor.
-    if sel.is_empty() {
-        let u = ctx.cursor as f32 * k;
+    if let Some(cursor) = ctx.cursor.filter(|_| sel.is_empty()) {
+        let u = cursor as f32 * k;
         let pts = project(proj, &[(u, v_bot), (u, v_top)], false);
         paint_poly(window, &pts, false, Some(2.0), false, if ctx.focused { theme::cursor() } else { theme::muted_text() });
     }
     let _ = bounds;
 }
 
-fn paint_linear_label(geo: &Geo, it: &Placed, label: &str, proj: &Proj, selected: bool, window: &mut Window, cx: &mut App) {
+fn paint_linear_label(geo: &Geo, it: &Placed, label: &str, proj: &Proj, color: Hsla, window: &mut Window, cx: &mut App) {
     if label.is_empty() {
         return;
     }
@@ -586,7 +641,6 @@ fn paint_linear_label(geo: &Geo, it: &Placed, label: &str, proj: &Proj, selected
     let w = label.chars().count() as f32 * geo.label_char_w;
     let (v_text_top, _) = if it.reverse { (lo - 1.0, ()) } else { (hi + 1.0 + LABEL_LINE, ()) };
     let p = proj.at(it.center(), v_text_top);
-    let color = if selected { theme::cursor() } else { theme::text() };
     // Keep labels near the ends inside the pane.
     let Proj::Linear { x0, .. } = *proj else { return };
     let (left, right) = (x0 - PAD + 2.0, x0 - PAD + geo.width - 2.0);
@@ -597,7 +651,6 @@ fn paint_linear_label(geo: &Geo, it: &Placed, label: &str, proj: &Proj, selected
 fn paint_circular_labels(ctx: &PaintCtx, proj: &Proj, window: &mut Window, cx: &mut App) {
     let geo = &ctx.geo;
     let Proj::Circular { cx: ccx, cy, r } = *proj else { return };
-    let sel = &ctx.selection;
     for l in &geo.circ_labels {
         let (u, anchor_v, label, colour, leader_colour) = if l.cut {
             let c = &geo.cut_marks[l.item];
@@ -606,9 +659,7 @@ fn paint_circular_labels(ctx: &PaintCtx, proj: &Proj, window: &mut Window, cx: &
             let it = &geo.placement.items[l.item];
             let (_, hi) = geo.v_range(it);
             let anchor_v = if it.reverse { hi.max(0.0) } else { hi };
-            let selected = sel.matches_extent(it.start, it.end, geo.len);
-            let colour = if selected { theme::cursor() } else { theme::text() };
-            (it.center(), anchor_v, &geo.labels[it.feature], colour, theme::ruler())
+            (it.center(), anchor_v, &geo.labels[it.feature], ctx.label_colour(it), theme::ruler())
         };
         let a = u / r;
         let anchor = proj.at(u, anchor_v + 1.0);
@@ -860,7 +911,7 @@ impl Render for DnaMap {
             self.scroll.set_offset(point(px(0.0), px(-top)));
         }
         let locks = Rc::new(ed.doc.locks().to_vec());
-        let paint = PaintCtx { geo: geo.clone(), name, selection, cursor, focused, locks: locks.clone() };
+        let paint = PaintCtx { geo: geo.clone(), name, selection, cursor: Some(cursor), focused, locks: locks.clone(), tones: Rc::default(), marked: None };
         let mouse = MouseCtx { geo: geo.clone(), features, editor: self.editor.clone(), editor_focus, circular: len > 0 && ed_circular, drag: self.drag.clone(), locks };
 
         let map = canvas(
@@ -891,9 +942,116 @@ impl Render for DnaMap {
     }
 }
 
+// ----- preview ---------------------------------------------------------------------
+
+/// Called with the index of the feature clicked.
+pub type OnFeatureClick = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// A map drawn from a list of features rather than an open document.
+pub struct Preview {
+    pub mode: MapMode,
+    /// The sequence's length; features are in its coordinates.
+    pub len: usize,
+    /// Shown in the middle of a circular map.
+    pub name: String,
+    pub features: Vec<Feature>,
+    /// Per feature; missing ones are [`Tone::Normal`].
+    pub tones: Vec<Tone>,
+    /// Drawn as if selected, like the editor's selected feature.
+    pub marked: Option<usize>,
+    /// Shaded like a selection: `(start, end)`, through the origin when `start > end`.
+    pub band: Option<(usize, usize)>,
+    pub height: f32,
+    /// Clicking a feature for which `clickable` is true calls `on_click` with its index.
+    pub clickable: Vec<bool>,
+    pub on_click: Option<OnFeatureClick>,
+}
+
+/// Draw `p`, filling the width it is given.
+pub fn preview(p: Preview) -> impl IntoElement {
+    let Preview { mode, len, name, features, tones, marked, band, height, clickable, on_click } = p;
+    let features = Rc::new(features);
+    let tones = Rc::new(tones);
+    let clickable = Rc::new(clickable);
+    canvas(
+        move |bounds, window, _| {
+            let ts = window.text_system();
+            let font_id = ts.resolve_font(&editor::editor_font());
+            let label_char_w: f32 = ts.advance(font_id, px(LABEL_SIZE), 'A').map(|s| s.width.into()).unwrap_or(LABEL_SIZE * 0.6);
+            let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let geo = (len > 0 && w >= 80.0 && h >= 60.0).then(|| Rc::new(Geo::compute(mode, &features, &[], len, w, h, label_char_w)));
+            (geo, window.insert_hitbox(bounds, HitboxBehavior::Normal))
+        },
+        move |bounds, (geo, hitbox), window, cx| {
+            let Some(geo) = geo else { return };
+            let (ox, oy) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+            let proj = match mode {
+                MapMode::Linear => Proj::Linear { x0: ox + PAD, y: oy + ((bh - geo.height) / 2.0).max(0.0) + geo.y_base },
+                MapMode::Circular => Proj::Circular { cx: ox + bw / 2.0, cy: oy + bh / 2.0, r: geo.r },
+            };
+            let selection = band.map_or(Selection { start: 0, end: 0 }, |(start, end)| Selection { start, end });
+            let ctx = PaintCtx { geo: geo.clone(), name: name.clone(), selection, cursor: None, focused: false, locks: Rc::default(), tones: tones.clone(), marked };
+            paint_map(&ctx, &proj, bounds, window, cx);
+            let Some(on_click) = on_click.clone() else { return };
+            let clickable = clickable.clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble() || ev.button != MouseButton::Left || !hitbox.is_hovered(window) {
+                    return;
+                }
+                let (u, v) = proj.inverse(ev.position);
+                if let Some(it) = geo.hit_where(u, v, |i| clickable.get(i).copied().unwrap_or(false)) {
+                    on_click(it.feature, window, cx);
+                    cx.stop_propagation();
+                }
+            });
+        },
+    )
+    .w_full()
+    .h(px(height))
+}
+
+/// The parts of `segments` (in a sequence `len` long) inside the region of `rlen`
+/// bases that starts at `offset`, in the region's coordinates. The region may run
+/// through the origin.
+pub fn clip_to_region(segments: &[(usize, usize)], offset: usize, rlen: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if len == 0 {
+        return out;
+    }
+    let rlen = rlen as i64;
+    for &(s, e) in segments {
+        let a = ((s + len - offset % len) % len) as i64;
+        let b = a + (e - s) as i64;
+        // The segment, and the same one turn back, so one that starts before the
+        // region but wraps into it is found too.
+        for turn in [0, len as i64] {
+            let (a, b) = ((a - turn).max(0), (b - turn).min(rlen));
+            if a < b {
+                out.push((a as usize, b as usize));
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn features_are_clipped_to_the_region() {
+        // A region of 100 bases from 200, in a 1,000-base sequence.
+        assert_eq!(clip_to_region(&[(250, 260)], 200, 100, 1000), vec![(50, 60)]);
+        assert_eq!(clip_to_region(&[(150, 250)], 200, 100, 1000), vec![(0, 50)]);
+        assert_eq!(clip_to_region(&[(280, 400)], 200, 100, 1000), vec![(80, 100)]);
+        assert_eq!(clip_to_region(&[(500, 600)], 200, 100, 1000), vec![]);
+        // A region through the origin: 950..50.
+        assert_eq!(clip_to_region(&[(10, 20)], 950, 100, 1000), vec![(60, 70)]);
+        assert_eq!(clip_to_region(&[(900, 1000), (0, 10)], 950, 100, 1000), vec![(0, 50), (50, 60)]);
+        assert_eq!(clip_to_region(&[(940, 960)], 950, 100, 1000), vec![(0, 10)]);
+    }
 
     #[test]
     fn circular_drag_crosses_the_origin_either_way() {

@@ -551,7 +551,7 @@ impl SeqEditor {
 
     /// Run a plugin's action on feature `fi`: open its dialog as a new task.
     fn run_plugin(&mut self, plugin: std::sync::Arc<crate::plugins::Plugin>, action: crate::plugins::manifest::Action, fi: usize, cx: &mut Context<Self>) {
-        use crate::plugins::dialog::{PluginView, Target};
+        use crate::plugins::dialog::{PluginView, Subject, Target};
         let Some(feature) = self.doc.features.get(fi).cloned() else { return };
         let protein = match Target::protein(&self.doc.seq, &feature) {
             Ok(p) => p,
@@ -568,7 +568,30 @@ impl SeqEditor {
                 plugin.manifest.name.clone(),
                 title,
                 editor.clone(),
-                |id, cx| cx.new(|cx| PluginView::new(id, editor, plugin, action, target, cx)).into(),
+                |id, cx| cx.new(|cx| PluginView::new(id, editor, plugin, action, Subject::Feature(target), cx)).into(),
+                cx,
+            );
+        });
+    }
+
+    /// Run a plugin action on the selection, or on the whole sequence if nothing is
+    /// selected.
+    fn run_region_plugin(&mut self, plugin: std::sync::Arc<crate::plugins::Plugin>, action: crate::plugins::manifest::Action, cx: &mut Context<Self>) {
+        use crate::plugins::dialog::{PluginView, Region, Subject};
+        if self.doc.len() == 0 {
+            self.message = Some(format!("{}: the sequence is empty", action.label.trim_end_matches('…')).into());
+            return cx.notify();
+        }
+        let region = Region::of(&self.doc, self.selection());
+        let editor = cx.entity().downgrade();
+        let where_ = if region.whole { self.doc.name.clone() } else { format!("{} bp of {}", thousands(region.bases.len()), self.doc.name) };
+        let title = format!("{} · {where_}", action.label.trim_end_matches('…'));
+        tasks::manager(cx).update(cx, |m, cx| {
+            m.create(
+                plugin.manifest.name.clone(),
+                title,
+                editor.clone(),
+                |id, cx| cx.new(|cx| PluginView::new(id, editor, plugin, action, Subject::Region(region), cx)).into(),
                 cx,
             );
         });
@@ -898,7 +921,7 @@ impl SeqEditor {
         });
 
         // Plugin actions for the right-clicked feature (only feature actions on
-        // protein exist so far).
+        // protein exist so far), then those for the selection or the whole sequence.
         let kind = menu.feature.and_then(|fi| self.doc.features.get(fi)).map(|f| f.kind.clone());
         let installed = cx.try_global::<crate::plugins::Registry>().is_some_and(|r| !r.plugins.is_empty());
         let actions: Vec<_> = kind
@@ -916,6 +939,21 @@ impl SeqEditor {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu = None;
                         this.run_plugin(plugin.clone(), action.clone(), fi, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        // Everything selected counts as the whole sequence, as `Region::of` treats it.
+        let on_selection = menu.selection && self.selection().bp(self.doc.len()) != self.doc.len();
+        for (k, (plugin, action)) in crate::plugins::region_actions(cx).into_iter().enumerate() {
+            plugin_items.push(
+                item_owned(("menu-region-plugin", k), action.label.clone())
+                    .gap_6()
+                    .child(div().text_xs().text_color(theme::muted_text()).child(if on_selection { "Selection" } else { "Whole sequence" }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.run_region_plugin(plugin.clone(), action.clone(), cx);
                         cx.notify();
                     }))
                     .into_any_element(),

@@ -1,14 +1,20 @@
 # Writing an Edict plugin
 
-A plugin is a Python script that adds an action to Edict: today, an item under
-right-click → **Plugins** on a feature, which takes the feature's protein and gives back
-a 3D structure. The app handles the menu, the settings form, the terminal, cancelling,
-locking the feature's bases and attaching the result. The plugin only computes.
+A plugin is a Python script that adds an action to Edict, an item under
+right-click → **Plugins**. There are two kinds:
+
+- **On a feature**: it takes the feature's protein and gives back a 3D structure.
+- **On a region**: it takes the selected bases, or the whole sequence when nothing is
+  selected, and gives back features. The user ticks which ones to add.
+
+The app handles the menu, the settings form, the terminal, cancelling, locking the
+bases, and adding the result to the document. The plugin only computes.
 
 Plugins are standalone. Edict ships with none installed. Each user decides which ones to
-add by putting their folders in the plugins folder. This repository keeps one real
-plugin, [`plugins/esmfold2`](../plugins/esmfold2/plugin.py), as a reference and for
-people who want it.
+add by putting their folders in the plugins folder. This repository keeps two real
+plugins, as references and for people who want them:
+[`plugins/esmfold2`](../plugins/esmfold2/plugin.py) (on a feature) and
+[`plugins/plannotate`](../plugins/plannotate/plugin.py) (on a region).
 
 - [Quick start](#quick-start)
 - [Where plugins live](#where-plugins-live)
@@ -161,9 +167,29 @@ needs and what it does.
 | `[[tool.edict.env]]` | no* | Where to get a Python, in order of preference. See [Environments](#environments). *A plugin with none can't run. |
 | `[[tool.edict.action]]` | yes | At least one. What the plugin offers and where. |
 | `[[tool.edict.setting]]` | no | The settings form. See [Settings](#settings). |
+| `[[tool.edict.cite]]` | no | Work to cite when results are published. See [Citations](#citations). |
 
 Unknown keys anywhere in `[tool.edict]` are an error, so a typo shows up in Settings
 instead of being silently ignored. Other `[tool.*]` tables in the block are left alone.
+
+### Citations
+
+If the plugin runs someone's published method, add a `[[tool.edict.cite]]` table for each
+paper it should be cited with. The app shows them on the result card of every run, under
+"If you publish results from *name*, please cite this:", with a link to each and a
+**Copy** button that copies them all as text. Settings lists them under the plugin too.
+
+```toml
+# [[tool.edict.cite]]
+# text = "McGuffie MJ, Barrick JE. pLannotate: engineered plasmid annotation. Nucleic Acids Res. 49(W1):W516–W522 (2021)."
+# doi = "10.1093/nar/gkab374"
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `text` | yes | The reference as it should be written: authors, title, where and when. |
+| `doi` | no | The bare DOI (`10.xxxx/...`), not a link. Shown as a link to `https://doi.org/…` and added to the copied text. |
+| `url` | no | A link to read it, for work without a DOI. Ignored when there is a DOI. |
 
 ### `[[tool.edict.action]]`
 
@@ -171,10 +197,10 @@ instead of being silently ignored. Other `[tool.*]` tables in the block are left
 |---|---|---|
 | `id` | yes | Unique within the plugin, same characters as the plugin id. Sent to the plugin as `request.action`. |
 | `label` | yes | The menu item. End it with `…` if it opens a dialog (it always does). |
-| `on` | yes | Where it appears. Only `"feature"` (a feature's right-click menu). |
-| `kinds` | no | Feature kinds it's offered on, matched without regard to case: `["CDS", "ORF"]`. Leave it out to offer it on every feature. |
-| `input` | yes | `"protein"`: the feature translated. `"dna"` is accepted by the manifest for future use, but the app doesn't offer such actions yet. |
-| `output` | yes | `"structure"`. |
+| `on` | yes | Where it appears: `"feature"` (a feature's right-click menu) or `"region"` (every right-click menu, acting on the selection, or on the whole sequence when nothing is selected). |
+| `kinds` | no | For `on = "feature"` only: feature kinds it's offered on, matched without regard to case: `["CDS", "ORF"]`. Leave it out to offer it on every feature. |
+| `input` | yes | On a feature: `"protein"`, the feature translated. (`"dna"` is accepted for future use, but the app doesn't offer such actions yet.) On a region: `"dna"`, the bases. |
+| `output` | yes | On a feature: `"structure"`. On a region: `"features"`. |
 | `description` | no | Free text. Not shown yet. |
 
 A plugin can have several actions. Each is its own menu item. Settings can be limited to
@@ -186,6 +212,22 @@ The feature's bases are translated with its genetic code (`/transl_table`) and r
 frame (`/codon_start`), across all its segments and on its strand. A first codon that the table allows as a
 start reads as M, as GenBank's `/translation` does. Trailing stop codons are dropped. A feature that encodes nothing, or has a stop codon inside it, is refused
 with a message in the status bar before the dialog opens.
+
+### What the app does with a region
+
+On a region the plugin gets the bases as they appear in the sequence, in upper or lower
+case as stored. A selection through the origin of a circular sequence is sent joined,
+from its first base through the origin to its last. Whether they're sent as circular
+DNA depends on what was right-clicked:
+
+| Selection | Sent as | `circular` |
+|---|---|---|
+| None, or all of the sequence, on a circular sequence | the whole sequence | `true` |
+| None, or all of the sequence, on a linear sequence | the whole sequence | `false` |
+| Part of the sequence | just those bases | `false` |
+
+So a plugin that searches for features should let them cross the end of the bases only
+when `circular` is true.
 
 ## Settings
 
@@ -267,10 +309,11 @@ it, with the progress shown in the terminal.
 
 ## How a run works
 
-1. The user picks the action. The app translates the feature and opens a task with
-   the settings form.
-2. On **Run**, the settings are saved, the feature's bases are **locked** (edits that
-   would change them are refused), and the app makes a scratch folder:
+1. The user picks the action. The app translates the feature (or takes the region's
+   bases) and opens a task with the settings form.
+2. On **Run**, the settings are saved, and the feature's or region's bases are
+   **locked**, so edits that would change them are refused. If they changed while the
+   dialog was open, the run is refused instead. Then the app makes a scratch folder:
 
    ```text
    ~/.cache/edict/tasks/<plugin-id>-<app-pid>-<task>-<ms>/     ($XDG_CACHE_HOME/edict/…)
@@ -304,9 +347,12 @@ it, with the progress shown in the terminal.
 5. On Linux the process's `oom_score_adj` is set to 1000, so if memory runs out the
    kernel stops the plugin before anything else.
 6. When the process exits, the app reads the last events, checks the result, and shows
-   a result card: metrics, a confidence strip, and **Attach to ‹feature›**,
-   **Save file…** and **Dismiss**. Attaching adds the structure to the document and
-   links the feature to its chain.
+   a result card:
+   - For a structure: metrics, a confidence strip, and **Attach to ‹feature›**,
+     **Save file…** and **Dismiss**. Attaching adds the structure to the document and
+     links the feature to its chain.
+   - For features: a list with a tick box on each, and **Add N features** and
+     **Dismiss** (see [Features](#features)).
 7. The lock is released and the scratch folder deleted when the result is dismissed
    (after attaching or not), or when the run fails or is cancelled.
 
@@ -335,6 +381,23 @@ the whole GPU. Later runs wait in the task list as **Queued**.
 - `input.sequences` is a list so that complexes can be sent later. Today it always holds
   one protein with id `"A"`, in one-letter codes, without a stop.
 - `input.feature.label` is the feature's label, or its kind if it has none.
+
+On a region, `input` holds the DNA instead:
+
+```json
+"input": {
+  "sequences": [{"id": "dna", "seq": "TCGCGCGTTTCGGTGATGACGG…", "circular": true}],
+  "region": {"start": 0, "end": 2686, "whole": true},
+  "doc_name": "pUC19"
+}
+```
+
+- `sequences` holds one DNA sequence with id `"dna"`. `circular` is explained under
+  [What the app does with a region](#what-the-app-does-with-a-region).
+- `region` says where the bases came from, 0-based and half-open. `start > end` means
+  the selection ran through the origin. `whole` is true when it is the whole sequence.
+  This is for the plugin's information only: results are given relative to the bases
+  sent, not to the document.
 
 ## Talking to the app: events
 
@@ -366,11 +429,12 @@ A `result` event's fields:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `kind` | yes | `"structure"`. |
-| `file` | yes | The structure file, relative to the scratch folder (or absolute but inside it). Paths that lead outside it are refused. |
+| `kind` | yes | `"structure"`, or `"features"` for an action with `output = "features"`. It must match the action's `output`. |
+| `features` | for features | See [Features](#features). |
+| `file` | for a structure | The structure file, relative to the scratch folder (or absolute but inside it). Paths that lead outside it are refused. |
 | `format` | no | `"mmcif"` (the default) or `"pdb"`. |
 | `chains` | no | The chain id for each input sequence, in order. |
-| `source` | no | Recorded with the attached structure, e.g. `"ESMFold2-Fast, seed 0"`. |
+| `source` | no | Recorded with the attached structure, e.g. `"ESMFold2-Fast, seed 0"`. For features, it is shown on the result card ("pLannotate v2.0.0 found 11 features"). |
 | `metrics` | no | `{"pTM": 0.84, "mean pLDDT": 88.1}`. Numbers are shown on the result card. Values that aren't numbers are ignored. |
 | `plddt` | no | Per-residue confidence, 0–100, one per residue. Drawn as a strip on the result card. |
 
@@ -391,6 +455,53 @@ the B-factor column (`_atom_site.B_iso_or_equiv`, or columns 61–66 in PDB) and
 data_prediction
 _struct.title 'My model prediction (pLDDT in B-factor)'
 ```
+
+### Features
+
+A `features` result lists what was found, in the same form a feature has in the edit
+log, plus two fields for the result card:
+
+```json
+{"event": "result", "kind": "features", "source": "pLannotate v2.0.0", "features": [
+  {"type": "CDS", "label": "AmpR", "strand": 1, "segments": [[884, 1745]],
+   "qualifiers": [["gene", "bla"], ["note", "confers resistance to ampicillin"]],
+   "detail": "snapgene · 99.8% identity · full length"},
+  {"type": "rep_origin", "label": "ori", "strand": 1, "segments": [[2601, 2686], [0, 504]]},
+  {"type": "CDS", "label": "lacI (fragment)", "strand": 1, "segments": [[0, 93]], "selected": false}
+]}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `type` | yes | The GenBank feature key: `CDS`, `promoter`, `misc_feature`, … |
+| `label` | yes | Its name. If `qualifiers` has no `label`, one is added with this value, so the name is saved with it. |
+| `strand` | no | `1` forward, `-1` reverse, `0` (the default) none. |
+| `segments` | yes | `[start, end)` pairs, 0-based and half-open, **relative to the bases sent** (0 is their first base). Give them in order along the forward strand, even on the reverse strand, as GenBank's `complement(join(…))` does. If the bases were sent as `circular`, a feature may run once through their end: `[[2601, 2686], [0, 504]]`. |
+| `qualifiers` | no | `[[key, value], …]` in order; `null` for a qualifier with no value. |
+| `detail` | no | One line shown under the feature on the result card. |
+| `selected` | no | Whether it starts ticked. Defaults to `true`. Untick doubtful ones (partial matches, say). |
+
+Each feature is checked before the result is offered: it needs a type, a strand of -1,
+0 or 1, and at least one segment, and every segment must be in order and within the
+bases sent. If any fails, the run fails with the reason.
+
+On the result card:
+
+- A map shows where they go. For the whole sequence it is the sequence's own map,
+  circular or linear; for a selection, a linear map of just those bases. The
+  document's own features are drawn faded for context, ticked features in full, and
+  unticked ones faint with a dashed outline. Clicking a feature on the map ticks or
+  unticks it, and pointing at a row in the list marks its feature on the map.
+- Each feature is listed with its name, type, location (1-based, in the document's
+  coordinates) and `detail`.
+- Features **already in the document** start unticked and are gathered under a closed
+  "N already in the document" heading. A feature counts as already there when one
+  in the document covers the same bases on the same strand and has the same type or the
+  same label (ignoring case).
+- **Add N features** adds the ticked ones, as one undo step. They go where the region
+  is now, so edits elsewhere in the sequence while the plugin ran don't matter. If the
+  region's bases changed anyway, or the whole sequence was rotated or grew, nothing is
+  added and the card says why.
 
 ## Success, failure and cancelling
 
@@ -429,7 +540,7 @@ running app. It uses only the standard library. Don't copy it into your plugin.
 | `progress(text, fraction=None)` | Sends a `progress` event. |
 | `warn(text)` | Prints `warning: …` to stderr and sends a `warn` event. |
 | `fail(message, code=1)` | Prints `error: …` to stderr, sends an `error` event, and exits immediately with `code` (`os._exit`: no cleanup handlers run). |
-| `result(kind, **fields)` | Sends a `result` event with the fields above. |
+| `result(kind, **fields)` | Sends a `result` event with the fields above: `result(kind="features", features=[…], source="…")`. |
 | `in_app() -> bool` | Whether `$EDICT_EVENTS` is set. Without it, events are silently dropped, so a plugin can also run outside the app. |
 | `mem_available() -> int \| None` | `MemAvailable` from `/proc/meminfo` in bytes (Linux). |
 | `rss() -> int \| None` | This process's resident memory in bytes (Linux). |
@@ -536,6 +647,8 @@ Some suggestions:
   hardware it expects.
 - Offer more than one environment, so users without your preferred tool can still run
   it.
+- Add a `[[tool.edict.cite]]` for each method the plugin runs, so the people who made
+  it get credit.
 - Bump `version` when you change behaviour, and say what changed.
 - Choose a distinctive `id`. Two plugins with the same id can't both be installed.
 

@@ -16,6 +16,11 @@
 # Face on first use into $HF_HOME. Needs a GPU with about 16 GB free for
 # 600-residue proteins; loading briefly needs about 34 GB of RAM."""
 #
+# # Shown with every result, as a reminder to cite the model.
+# [[tool.edict.cite]]
+# text = "Candido S, Hayes T, Derry A, et al. Language Modeling Materializes a World Model of Protein Biology. bioRxiv 2026.06.03.729735 (2026)."
+# doi = "10.64898/2026.06.03.729735"
+#
 # # Tried in order; the first that works here is used (choose one in Settings → Plugins).
 # # The app's own flake: ROCm torch + esm, built by nix (prebuilt torch from the cache).
 # [[tool.edict.env]]

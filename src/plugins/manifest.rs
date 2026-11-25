@@ -58,6 +58,42 @@ pub struct Manifest {
     pub actions: Vec<Action>,
     #[serde(default, rename = "setting")]
     pub settings: Vec<Setting>,
+    /// The work to cite when results are published, shown with every result.
+    #[serde(default, rename = "cite")]
+    pub citations: Vec<Citation>,
+}
+
+/// A paper (or other work) to cite, from a `[[tool.edict.cite]]` table.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Citation {
+    /// The reference as it should be written: authors, title, journal, year.
+    pub text: String,
+    #[serde(default)]
+    pub doi: Option<String>,
+    /// Where to read it, when there's no DOI.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl Citation {
+    /// Where the reference can be read: its DOI's link, or its URL.
+    pub fn link(&self) -> Option<String> {
+        match (&self.doi, &self.url) {
+            (Some(doi), _) => Some(format!("https://doi.org/{doi}")),
+            (None, url) => url.clone(),
+        }
+    }
+
+    /// The reference with its DOI or URL, as copied.
+    pub fn full(&self) -> String {
+        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match (&self.doi, &self.url) {
+            (Some(doi), _) => format!("{text} https://doi.org/{doi}"),
+            (None, Some(url)) => format!("{text} {url}"),
+            (None, None) => text,
+        }
+    }
 }
 
 /// Where the plugin's Python comes from.
@@ -132,22 +168,29 @@ pub struct Action {
     pub id: String,
     /// The menu item's text.
     pub label: String,
-    /// What it's offered on: "feature" (a feature's right-click menu).
+    /// What it's offered on: "feature" (a feature's right-click menu) or "region"
+    /// (the selection's menu, or the whole sequence's when nothing is selected).
     pub on: String,
     /// Feature kinds it's offered for ("CDS", "ORF"); empty for every kind.
     #[serde(default)]
     pub kinds: Vec<String>,
     /// What the plugin is given: "protein" (the feature translated) or "dna".
     pub input: String,
-    /// What it gives back: "structure".
+    /// What it gives back: "structure" (on a feature) or "features" (on a region).
     pub output: String,
     #[serde(default)]
     pub description: Option<String>,
 }
 
 impl Action {
+    /// Offered on the menu of a feature of this kind.
     pub fn offered_for(&self, kind: &str) -> bool {
         self.on == "feature" && (self.kinds.is_empty() || self.kinds.iter().any(|k| k.eq_ignore_ascii_case(kind)))
+    }
+
+    /// Offered on a region: the selection, or the whole sequence.
+    pub fn on_region(&self) -> bool {
+        self.on == "region"
     }
 }
 
@@ -335,14 +378,38 @@ fn check(m: &Manifest) -> Result<()> {
             bail!("action id {:?} is missing, repeated, or has characters other than a-z 0-9 - _", a.id);
         }
         seen.push(&a.id);
-        if a.on != "feature" {
-            bail!("action {}: on = {:?} isn't supported (only \"feature\")", a.id, a.on);
+        match a.on.as_str() {
+            "feature" => {
+                if !matches!(a.input.as_str(), "protein" | "dna") {
+                    bail!("action {}: input = {:?} isn't supported on a feature (\"protein\" or \"dna\")", a.id, a.input);
+                }
+                if a.output != "structure" {
+                    bail!("action {}: output = {:?} isn't supported on a feature (only \"structure\")", a.id, a.output);
+                }
+            }
+            "region" => {
+                if a.input != "dna" {
+                    bail!("action {}: input = {:?} isn't supported on a region (only \"dna\")", a.id, a.input);
+                }
+                if a.output != "features" {
+                    bail!("action {}: output = {:?} isn't supported on a region (only \"features\")", a.id, a.output);
+                }
+                if !a.kinds.is_empty() {
+                    bail!("action {}: kinds only applies to actions on a feature", a.id);
+                }
+            }
+            other => bail!("action {}: on = {other:?} isn't supported (\"feature\" or \"region\")", a.id),
         }
-        if !matches!(a.input.as_str(), "protein" | "dna") {
-            bail!("action {}: input = {:?} isn't supported (\"protein\" or \"dna\")", a.id, a.input);
+    }
+    for c in &m.citations {
+        if c.text.trim().is_empty() {
+            bail!("a [[tool.edict.cite]] needs text: the reference as it should be written");
         }
-        if a.output != "structure" {
-            bail!("action {}: output = {:?} isn't supported (only \"structure\")", a.id, a.output);
+        if c.doi.as_deref().is_some_and(|d| !d.starts_with("10.") || d.contains(char::is_whitespace)) {
+            bail!("cite doi {:?}: give the DOI itself (10.xxxx/...), not a link", c.doi.as_deref().unwrap_or(""));
+        }
+        if c.url.as_deref().is_some_and(|u| !u.starts_with("https://") && !u.starts_with("http://")) {
+            bail!("cite url {:?}: use a full http(s) link", c.url.as_deref().unwrap_or(""));
         }
     }
     let mut keys = Vec::new();
@@ -437,6 +504,38 @@ import sys
         assert!(parse(&GOOD.replace("kind = \"uv\"", "kind = \"pip\"")).is_err());
         // An unclosed block.
         assert!(parse(&GOOD.replace("# ///\nimport", "import")).is_err());
+    }
+
+    #[test]
+    fn citations() {
+        let cite = |body: &str| GOOD.replace("# ///\nimport", &format!("#\n# [[tool.edict.cite]]\n{body}\n# ///\nimport"));
+        let m = parse(&cite("# text = \"Doe J. A tool. J Tools. 2020.\"\n# doi = \"10.1000/xyz\"")).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(m.citations[0].link().as_deref(), Some("https://doi.org/10.1000/xyz"));
+        assert_eq!(m.citations[0].full(), "Doe J. A tool. J Tools. 2020. https://doi.org/10.1000/xyz");
+        assert!(parse(GOOD).unwrap().citations.is_empty());
+        // Text is required; a DOI is the bare DOI; a URL is a link.
+        assert!(parse(&cite("# doi = \"10.1000/xyz\"")).is_err());
+        assert!(parse(&cite("# text = \"x\"\n# doi = \"https://doi.org/10.1000/xyz\"")).is_err());
+        assert!(parse(&cite("# text = \"x\"\n# url = \"example.org\"")).is_err());
+        assert!(parse(&cite("# text = \"x\"\n# url = \"https://example.org\"")).is_ok());
+    }
+
+    #[test]
+    fn region_actions() {
+        let region = GOOD
+            .replace("on = \"feature\"\n# kinds = [\"CDS\", \"ORF\"]", "on = \"region\"")
+            .replace("input = \"protein\"", "input = \"dna\"")
+            .replace("output = \"structure\"", "output = \"features\"");
+        let m = parse(&region).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(m.actions[0].on_region());
+        assert!(!m.actions[0].offered_for("CDS"));
+        // A region gives DNA and takes back features, and has no feature kinds.
+        assert!(parse(&region.replace("input = \"dna\"", "input = \"protein\"")).is_err());
+        assert!(parse(&region.replace("output = \"features\"", "output = \"structure\"")).is_err());
+        assert!(parse(&region.replace("on = \"region\"", "on = \"region\"\n# kinds = [\"CDS\"]")).is_err());
+        assert!(parse(&region.replace("on = \"region\"", "on = \"selection\"")).is_err());
+        // And a feature's action can't give features.
+        assert!(parse(&GOOD.replace("output = \"structure\"", "output = \"features\"")).is_err());
     }
 
     #[test]

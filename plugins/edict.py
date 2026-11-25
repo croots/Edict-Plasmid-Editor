@@ -76,7 +76,8 @@ def fail(message: str, code: int = 1) -> "NoReturn":  # noqa: F821
 
 
 def result(kind: str, **fields) -> None:
-    """The run's result. kinds: "structure" (file, format, chains, ...), "report"."""
+    """The run's result. kinds: "structure" (file, format, chains, ...) or "features"
+    (features=[{type, label, strand, segments, qualifiers, detail, selected}, ...])."""
     _emit({"event": "result", "kind": kind, **fields})
 
 

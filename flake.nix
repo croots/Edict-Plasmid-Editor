@@ -50,6 +50,9 @@
         # torch closure is several GB. See nix/esmfold2.nix.
         esmfold2 = import ./nix/esmfold2.nix { inherit pkgs; accel = "rocm"; };
         esmfold2-cpu = import ./nix/esmfold2.nix { inherit pkgs; accel = "cpu"; };
+        # pLannotate, its search tools and databases, for the pLannotate plugin.
+        # See nix/plannotate.nix.
+        plannotate = import ./nix/plannotate.nix { inherit pkgs; };
       in {
         # `nix run .#esmfold2 -- -s MQIFVKTLTG... -o ubq.cif`
         packages.esmfold2 = esmfold2.predict;
@@ -58,6 +61,11 @@
         # The Python the ESMFold2 plugin runs in (`nix shell .#esmfold2-env -c python`).
         packages.esmfold2-env = esmfold2.env;
         packages.esmfold2-cpu-env = esmfold2-cpu.env;
+
+        # `nix run .#plannotate -- batch -i plasmid.fa`
+        packages.plannotate = plannotate.plannotate;
+        # The Python the pLannotate plugin runs in (`nix shell .#plannotate-env -c python`).
+        packages.plannotate-env = plannotate.env;
 
         # `nix develop .#esmfold2`: Python with `esm` importable, plus the CLI.
         devShells.esmfold2 = pkgs.mkShell {

@@ -1,10 +1,12 @@
 //! Plugins: readable Python scripts in `~/.config/edict/plugins/<id>/plugin.py`
-//! that add actions to the app (Predict structure on a CDS's right-click menu).
+//! that add actions to the app: Predict structure on a CDS's right-click menu, or
+//! Annotate on a region's (the selection, or the whole sequence).
 //!
 //! A plugin's manifest (see `manifest`) says which Python environment it runs in,
 //! where it appears, and what settings its dialog offers. Running it is a task like a
 //! BLAST search: its dialog shows the settings, then the script's terminal output
-//! (and can be backgrounded), then the result, which the user may attach.
+//! (and can be backgrounded), then the result, which the user may attach (a
+//! structure) or pick from and add (features).
 
 pub mod dialog;
 pub mod env;
@@ -120,6 +122,15 @@ pub fn actions_for(kind: &str, cx: &App) -> Vec<(Arc<Plugin>, Action)> {
         .collect()
 }
 
+/// The plugin actions offered on a region (the selection, or the whole sequence).
+pub fn region_actions(cx: &App) -> Vec<(Arc<Plugin>, Action)> {
+    let Some(reg) = cx.try_global::<Registry>() else { return Vec::new() };
+    reg.plugins
+        .iter()
+        .flat_map(|p| p.manifest.actions.iter().filter(|a| a.on_region()).map(move |a| (p.clone(), a.clone())))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +142,15 @@ mod tests {
     fn the_esmfold2_plugin_has_a_valid_manifest() {
         let m = manifest::parse(ESMFOLD2).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(m.id, "esmfold2");
+        assert_eq!(m.citations[0].doi.as_deref(), Some("10.64898/2026.06.03.729735"));
+    }
+
+    #[test]
+    fn the_plannotate_plugin_has_a_valid_manifest() {
+        let m = manifest::parse(include_str!("../../plugins/plannotate/plugin.py")).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(m.id, "plannotate");
+        assert!(m.actions.iter().all(|a| a.on_region() && a.output == "features"));
+        assert_eq!(m.citations[0].doi.as_deref(), Some("10.1093/nar/gkab374"));
     }
 
     #[test]
