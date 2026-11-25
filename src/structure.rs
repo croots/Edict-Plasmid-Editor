@@ -45,6 +45,8 @@ pub struct Residue {
     pub ss: Ss,
     /// The atom the backbone trace passes through (`CA`, or `P` for nucleic acids).
     pub trace: Option<usize>,
+    /// The backbone carbonyl oxygen (`O`) of an amino acid, which orients cartoon ribbons.
+    pub carbonyl: Option<usize>,
     pub atoms: Range<usize>,
 }
 
@@ -445,10 +447,14 @@ fn build(raw: Raw) -> Molecule {
             let a0 = mol.atoms.len();
             let ri = mol.residues.len();
             let mut trace = None;
+            let mut carbonyl = None;
             for a in &atoms {
                 let ix = mol.atoms.len();
                 if polymer && trace.is_none() && (a.name == "CA" || a.name == "P") {
                     trace = Some(ix);
+                }
+                if polymer && carbonyl.is_none() && a.name == "O" {
+                    carbonyl = Some(ix);
                 }
                 mol.atoms.push(Atom { pos: a.pos, element: a.element.clone(), residue: ri, b_factor: a.b_factor });
             }
@@ -468,6 +474,7 @@ fn build(raw: Raw) -> Molecule {
                 letters,
                 ss: Ss::Coil,
                 trace,
+                carbonyl,
                 atoms: a0..mol.atoms.len(),
             });
         }

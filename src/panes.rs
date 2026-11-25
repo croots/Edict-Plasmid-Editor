@@ -336,6 +336,10 @@ impl PaneGroup {
         let has_history = doc.format == Format::Native;
         let mut list = div()
             .id("split-menu")
+            // Without this a press on an item also lands on whatever is beneath —
+            // typically the pane's toolbar (a 3D view's Attach…/Remove) — and both
+            // click on release.
+            .occlude()
             .min_w(px(180.0))
             .p_1()
             .rounded_md()

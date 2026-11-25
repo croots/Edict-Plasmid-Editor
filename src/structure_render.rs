@@ -106,6 +106,9 @@ pub fn principal_axes(points: &[V3], center: V3) -> M3 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
+    /// Ribbons for helices, arrows for strands and a thin tube for loops, as in PyMOL;
+    /// ligands and modified residues as small balls.
+    Cartoon,
     /// A tube along the backbone, thicker through helices and strands; ligands and
     /// modified residues (like a chromophore) as small balls.
     Tube,
@@ -268,10 +271,39 @@ pub fn residue_colors(mol: &Molecule, coloring: Coloring, alphafold: bool, featu
 
 const HIGHLIGHT_MIX: f32 = 0.7;
 
-/// Model-space spheres for `mol`. `highlight` residues are tinted with `accent`.
-pub fn build_spheres(mol: &Molecule, style: Style, colors: &[V3], highlight: &[bool], accent: V3) -> Vec<Sphere> {
+/// Each chain's trace atoms, split into unbroken runs of (position, residue).
+fn chain_runs(mol: &Molecule) -> Vec<Vec<(V3, usize)>> {
+    let mut runs = Vec::new();
+    for chain in &mol.chains {
+        let mut run: Vec<(V3, usize)> = Vec::new();
+        let mut prev: Option<usize> = None;
+        for r in chain.residues.clone() {
+            let res = &mol.residues[r];
+            let Some(t) = res.trace.filter(|_| res.polymer) else { continue };
+            let p = mol.atoms[t].pos;
+            if let (Some(&(q, _)), Some(pr)) = (run.last(), prev) {
+                // A gap in the model (missing residues) breaks the tube. Residues
+                // that stand for several (chromophores) reach further.
+                let extra = (mol.residues[pr].letters.len() + res.letters.len()).saturating_sub(2) as f32;
+                let limit = if mol.atoms[t].element == "P" { 8.0 } else { 4.6 } + 3.8 * extra;
+                let d = sub(p, q);
+                if dot(d, d) > limit * limit {
+                    runs.push(std::mem::take(&mut run));
+                }
+            }
+            run.push((p, r));
+            prev = Some(r);
+        }
+        runs.push(run);
+    }
+    runs
+}
+
+/// The model-space scene for `mol`. `highlight` residues are tinted with `accent`.
+pub fn build_scene(mol: &Molecule, style: Style, colors: &[V3], highlight: &[bool], accent: V3) -> Scene {
     let tint = |r: usize, c: V3| if highlight.get(r).copied().unwrap_or(false) { mix(c, accent, HIGHLIGHT_MIX) } else { c };
-    let mut out = Vec::new();
+    let mut scene = Scene::default();
+    let out = &mut scene.spheres;
     match style {
         Style::Atoms => {
             for a in &mol.atoms {
@@ -281,30 +313,15 @@ pub fn build_spheres(mol: &Molecule, style: Style, colors: &[V3], highlight: &[b
                 out.push(Sphere { c: a.pos, r: element_radius(&a.element), color: tint(a.residue, base), residue: a.residue as u32 });
             }
         }
-        Style::Tube => {
-            for chain in &mol.chains {
-                let mut run: Vec<(V3, usize)> = Vec::new();
-                let mut prev: Option<usize> = None;
-                for r in chain.residues.clone() {
-                    let res = &mol.residues[r];
-                    let Some(t) = res.trace.filter(|_| res.polymer) else { continue };
-                    let p = mol.atoms[t].pos;
-                    if let (Some(&(q, _)), Some(pr)) = (run.last(), prev) {
-                        // A gap in the model (missing residues) breaks the tube. Residues
-                        // that stand for several (chromophores) reach further.
-                        let extra = (mol.residues[pr].letters.len() + res.letters.len()).saturating_sub(2) as f32;
-                        let limit = if mol.atoms[t].element == "P" { 8.0 } else { 4.6 } + 3.8 * extra;
-                        let d = sub(p, q);
-                        if dot(d, d) > limit * limit {
-                            tube(&mut out, &run, mol, colors, &tint);
-                            run.clear();
-                        }
-                    }
-                    run.push((p, r));
-                    prev = Some(r);
+        Style::Tube | Style::Cartoon => {
+            for run in chain_runs(mol) {
+                if style == Style::Cartoon {
+                    cartoon(&mut scene, &run, mol, colors, &tint);
+                } else {
+                    tube(&mut scene.spheres, &run, mol, colors, &tint);
                 }
-                tube(&mut out, &run, mol, colors, &tint);
             }
+            let out = &mut scene.spheres;
             // Ligands, ions and modified residues as balls in element colours.
             for (r, res) in mol.residues.iter().enumerate() {
                 if res.polymer && !res.is_modified() {
@@ -324,7 +341,7 @@ pub fn build_spheres(mol: &Molecule, style: Style, colors: &[V3], highlight: &[b
             }
         }
     }
-    out
+    scene
 }
 
 fn tube_radius(ss: Ss) -> f32 {
@@ -374,6 +391,243 @@ fn tube(out: &mut Vec<Sphere>, run: &[(V3, usize)], mol: &Molecule, colors: &[V3
     out.push(sphere(p, tube_radius(mol.residues[r].ss), r));
 }
 
+// ----- cartoon ------------------------------------------------------------------------
+
+/// A triangle of the cartoon mesh, in model space, with per-vertex normals and colours.
+#[derive(Clone, Copy, Debug)]
+pub struct Tri {
+    pub v: [V3; 3],
+    pub n: [V3; 3],
+    pub color: [V3; 3],
+    pub residue: u32,
+}
+
+/// Everything to draw: shaded spheres and a lit triangle mesh.
+#[derive(Clone, Debug, Default)]
+pub struct Scene {
+    pub spheres: Vec<Sphere>,
+    pub tris: Vec<Tri>,
+}
+
+/// A ribbon cross-section: half-width, half-thickness and superellipse exponent
+/// (2 is an ellipse; larger is boxier).
+#[derive(Clone, Copy, Debug)]
+struct Section {
+    hw: f32,
+    ht: f32,
+    e: f32,
+}
+
+const HELIX: Section = Section { hw: 1.4, ht: 0.22, e: 2.4 };
+const STRAND: Section = Section { hw: 1.15, ht: 0.3, e: 8.0 };
+const COIL: Section = Section { hw: 0.36, ht: 0.36, e: 2.0 };
+/// Half-width at the back of a strand's arrowhead.
+const ARROW_HW: f32 = 1.9;
+/// Vertices around each cross-section, and cross-sections per residue.
+const RING: usize = 16;
+const CARTOON_STEPS: usize = 10;
+
+fn section(ss: Ss) -> Section {
+    match ss {
+        Ss::Helix => HELIX,
+        Ss::Strand => STRAND,
+        Ss::Coil => COIL,
+    }
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn lerp_section(a: Section, b: Section, t: f32) -> Section {
+    Section { hw: lerp(a.hw, b.hw, t), ht: lerp(a.ht, b.ht, t), e: lerp(a.e, b.e, t) }
+}
+
+fn add(a: V3, b: V3) -> V3 {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+/// Any unit vector perpendicular to `t`.
+fn perpendicular(t: V3) -> V3 {
+    let a = if t[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+    normalize(cross(t, a))
+}
+
+struct Ring {
+    pts: [V3; RING],
+    nrm: [V3; RING],
+    color: V3,
+    res: usize,
+    /// Stitch to the previous ring.
+    join: bool,
+}
+
+/// The cross-section `sec` at `p`, with tangent `t` and width axis `w`. `flat` replaces
+/// the profile's normals (for caps and the back of arrowheads); `collapse` shrinks the
+/// ring to its centre (the tip of a cap).
+#[allow(clippy::too_many_arguments)]
+fn ring(p: V3, t: V3, w: V3, sec: Section, flat: Option<V3>, collapse: bool, color: V3, res: usize, join: bool) -> Ring {
+    let up = cross(t, w);
+    let mut pts = [p; RING];
+    let mut nrm = [up; RING];
+    let ex = 2.0 / sec.e;
+    for k in 0..RING {
+        let (s, c) = (std::f32::consts::TAU * k as f32 / RING as f32).sin_cos();
+        let (ux, uy) = (c.signum() * c.abs().powf(ex), s.signum() * s.abs().powf(ex));
+        if !collapse {
+            pts[k] = add(p, add(scale(w, ux * sec.hw), scale(up, uy * sec.ht)));
+        }
+        nrm[k] = flat.unwrap_or_else(|| {
+            // The gradient of the superellipse |x/hw|^e + |y/ht|^e.
+            let gx = ux.signum() * ux.abs().powf(sec.e - 1.0) / sec.hw;
+            let gy = uy.signum() * uy.abs().powf(sec.e - 1.0) / sec.ht;
+            normalize(add(scale(w, gx), scale(up, gy)))
+        });
+    }
+    Ring { pts, nrm, color, res, join }
+}
+
+fn stitch(out: &mut Vec<Tri>, rings: &[Ring]) {
+    for pair in rings.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if !b.join {
+            continue;
+        }
+        let res = a.res as u32;
+        for k in 0..RING {
+            let k2 = (k + 1) % RING;
+            out.push(Tri { v: [a.pts[k], b.pts[k], b.pts[k2]], n: [a.nrm[k], b.nrm[k], b.nrm[k2]], color: [a.color, b.color, b.color], residue: res });
+            out.push(Tri { v: [a.pts[k], b.pts[k2], a.pts[k2]], n: [a.nrm[k], b.nrm[k2], a.nrm[k2]], color: [a.color, b.color, a.color], residue: res });
+        }
+    }
+}
+
+/// A cartoon along one unbroken run of trace atoms: flat ribbons through helices,
+/// boxy arrows through strands and a thin round tube elsewhere. Ribbons are oriented by
+/// the backbone carbonyls (which point along a helix's axis and lie in a sheet's plane).
+fn cartoon(scene: &mut Scene, run: &[(V3, usize)], mol: &Molecule, colors: &[V3], tint: &dyn Fn(usize, V3) -> V3) {
+    let n = run.len();
+    if n == 0 {
+        return;
+    }
+    let color = |r: usize| tint(r, colors[r]);
+    if n == 1 {
+        let (p, r) = run[0];
+        scene.spheres.push(Sphere { c: p, r: COIL.hw * 1.6, color: color(r), residue: r as u32 });
+        return;
+    }
+    let ss: Vec<Ss> = run.iter().map(|&(_, r)| mol.residues[r].ss).collect();
+    let raw: Vec<V3> = run.iter().map(|&(p, _)| p).collect();
+
+    // Strands pleat; average each strand residue with its neighbours to straighten them.
+    let mut pts = raw.clone();
+    for i in 1..n - 1 {
+        if ss[i] == Ss::Strand {
+            pts[i] = scale(add(add(raw[i - 1], raw[i + 1]), scale(raw[i], 2.0)), 0.25);
+        }
+    }
+
+    // The width direction at each residue, kept from flipping between neighbours.
+    let tangent = |i: usize| normalize(sub(pts[(i + 1).min(n - 1)], pts[i.saturating_sub(1)]));
+    let mut guide: Vec<Option<V3>> = (0..n)
+        .map(|i| {
+            let res = &mol.residues[run[i].1];
+            let t = tangent(i);
+            let g = match res.carbonyl {
+                Some(o) => sub(mol.atoms[o].pos, raw[i]),
+                None if i > 0 && i + 1 < n => cross(t, sub(scale(raw[i], 2.0), add(raw[i - 1], raw[i + 1]))),
+                None => return None,
+            };
+            let g = sub(g, scale(t, dot(g, t)));
+            (dot(g, g) > 1e-6).then(|| normalize(g))
+        })
+        .collect();
+    // Fill gaps from neighbours, or any perpendicular when there are none at all.
+    for i in 1..n {
+        if guide[i].is_none() {
+            guide[i] = guide[i - 1];
+        }
+    }
+    for i in (0..n - 1).rev() {
+        if guide[i].is_none() {
+            guide[i] = guide[i + 1];
+        }
+    }
+    let mut guide: Vec<V3> = guide.into_iter().enumerate().map(|(i, g)| g.unwrap_or_else(|| perpendicular(tangent(i)))).collect();
+    for i in 1..n {
+        if dot(guide[i], guide[i - 1]) < 0.0 {
+            guide[i] = scale(guide[i], -1.0);
+        }
+    }
+    let unsmoothed = guide.clone();
+    for i in 1..n - 1 {
+        if ss[i] == Ss::Strand {
+            guide[i] = normalize(add(add(unsmoothed[i - 1], unsmoothed[i + 1]), scale(unsmoothed[i], 2.0)));
+        }
+    }
+
+    // Each strand's last residue is its arrow's tip: the segment before it is the head.
+    let mut sec: Vec<Section> = ss.iter().map(|&s| section(s)).collect();
+    let mut arrow = vec![false; n];
+    for i in 1..n {
+        if ss[i] == Ss::Strand && ss[i - 1] == Ss::Strand && (i + 1 == n || ss[i + 1] != Ss::Strand) {
+            arrow[i - 1] = true;
+            sec[i] = COIL;
+        }
+    }
+
+    let mut rings: Vec<Ring> = Vec::with_capacity((n - 1) * CARTOON_STEPS + 8);
+    for j in 0..n - 1 {
+        let p0 = pts[j.saturating_sub(1)];
+        let (p1, p2) = (pts[j], pts[j + 1]);
+        let p3 = pts[(j + 2).min(n - 1)];
+        let last = j + 2 == n;
+        let steps = if last { CARTOON_STEPS + 1 } else { CARTOON_STEPS };
+        for k in 0..steps {
+            let t = k as f32 / CARTOON_STEPS as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let mut p = [0.0; 3];
+            let mut d = [0.0; 3];
+            for a in 0..3 {
+                let (c1, c2, c3) = (p2[a] - p0[a], 2.0 * p0[a] - 5.0 * p1[a] + 4.0 * p2[a] - p3[a], 3.0 * p1[a] - p0[a] - 3.0 * p2[a] + p3[a]);
+                p[a] = 0.5 * (2.0 * p1[a] + c1 * t + c2 * t2 + c3 * t3);
+                d[a] = 0.5 * (c1 + 2.0 * c2 * t + 3.0 * c3 * t2);
+            }
+            let tan = if dot(d, d) > 1e-8 { normalize(d) } else { tangent(j) };
+            let s = t * t * (3.0 - 2.0 * t);
+            let g = mix(guide[j], guide[j + 1], s);
+            let g = sub(g, scale(tan, dot(g, tan)));
+            let w = if dot(g, g) > 1e-6 { normalize(g) } else { perpendicular(tan) };
+            let section = if arrow[j] {
+                Section { hw: lerp(ARROW_HW, COIL.hw, t), ht: lerp(STRAND.ht, COIL.ht, t), e: STRAND.e }
+            } else {
+                lerp_section(sec[j], sec[j + 1], s)
+            };
+            let res = if t < 0.5 { run[j].1 } else { run[j + 1].1 };
+            let c = color(res);
+            let back = Some(scale(tan, -1.0));
+            if j == 0 && k == 0 {
+                // Close the start.
+                rings.push(ring(p, tan, w, sec[0], back, true, c, res, false));
+                rings.push(ring(p, tan, w, sec[0], back, false, c, res, true));
+            }
+            if arrow[j] && k == 0 {
+                // The step out to the back of the arrowhead.
+                rings.push(ring(p, tan, w, sec[j], None, false, c, res, true));
+                rings.push(ring(p, tan, w, sec[j], back, false, c, res, true));
+                rings.push(ring(p, tan, w, section, back, false, c, res, true));
+            }
+            rings.push(ring(p, tan, w, section, None, false, c, res, true));
+            if last && k + 1 == steps {
+                // Close the end.
+                rings.push(ring(p, tan, w, section, Some(tan), false, c, res, true));
+                rings.push(ring(p, tan, w, section, Some(tan), true, c, res, true));
+            }
+        }
+    }
+    stitch(&mut scene.tris, &rings);
+}
+
 /// Where the camera is: model space is rotated about `center`, then scaled to pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -408,132 +662,364 @@ impl Frame {
     }
 }
 
-/// Draw `spheres` into a `width` × `height` image, supersampled `ss` × `ss`.
-pub fn render(spheres: &[Sphere], cam: &Camera, width: usize, height: usize, ss: usize, bg: V3, outline: V3) -> Frame {
+/// A sphere on the supersampled screen: centre, depth and radius in pixels.
+#[derive(Clone, Copy, Default)]
+struct ProjSphere {
+    x: f32,
+    y: f32,
+    z: f32,
+    r: f32,
+}
+
+/// A triangle on the supersampled screen, as planes over (x, y): its three barycentric
+/// weights and its depth. View-space normals are ready for shading.
+#[derive(Clone, Copy, Default)]
+struct ProjTri {
+    bary: [[f32; 3]; 3],
+    z: [f32; 3],
+    n: [V3; 3],
+    /// Pixel bounds (inclusive); `y0 > y1` when the triangle is culled.
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+}
+
+fn plane(p: &[f32; 3], x: f32, y: f32) -> f32 {
+    p[0] * x + p[1] * y + p[2]
+}
+
+/// Runs `f(index, item)` over `items` on every core, handing out items as threads free up.
+fn par_each<T: Send>(items: Vec<T>, f: impl Fn(usize, T) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len().max(1));
+    let queue = std::sync::Mutex::new(items.into_iter().enumerate());
+    let next = || queue.lock().unwrap().next();
+    if threads <= 1 {
+        while let Some((i, t)) = next() {
+            f(i, t);
+        }
+        return;
+    }
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                while let Some((i, t)) = next() {
+                    f(i, t);
+                }
+            });
+        }
+    });
+}
+
+/// Rows of output per unit of parallel work.
+const BAND: usize = 16;
+
+/// Draw `scene` into a `width` × `height` image, supersampled `ss` × `ss`. The work is
+/// split into horizontal bands across all cores.
+pub fn render(scene: &Scene, cam: &Camera, width: usize, height: usize, ss: usize, bg: V3, outline: V3) -> Frame {
+    let spheres = &scene.spheres;
+    let ns = spheres.len();
     let ss = ss.max(1);
     let (w, h) = (width * ss, height * ss);
-    let n = w * h;
-    let mut depth = vec![f32::NEG_INFINITY; n];
-    let mut owner = vec![u32::MAX; n];
     let k = cam.scale * ss as f32;
     let (cx, cy) = (w as f32 / 2.0 + cam.pan.0 * ss as f32, h as f32 / 2.0 + cam.pan.1 * ss as f32);
+    let rot = cam.rot;
 
-    // Project, then splat each sphere's disc, keeping the nearest surface per pixel.
-    let mut proj: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(spheres.len());
+    // Project. Spheres are few; triangles are projected in parallel chunks.
+    let sproj: Vec<ProjSphere> = spheres
+        .iter()
+        .map(|s| {
+            let v = mat_vec(&rot, sub(s.c, cam.center));
+            ProjSphere { x: cx + v[0] * k, y: cy - v[1] * k, z: v[2] * k, r: s.r * k }
+        })
+        .collect();
+    let mut tproj = vec![ProjTri::default(); scene.tris.len()];
     let (mut zmin, mut zmax) = (f32::INFINITY, f32::NEG_INFINITY);
-    for (i, s) in spheres.iter().enumerate() {
-        let v = mat_vec(&cam.rot, sub(s.c, cam.center));
-        let (sx, sy, sz, rp) = (cx + v[0] * k, cy - v[1] * k, v[2] * k, s.r * k);
-        proj.push((sx, sy, sz, rp));
-        zmin = zmin.min(sz - rp);
-        zmax = zmax.max(sz + rp);
-        if rp <= 0.0 || sx + rp < 0.0 || sy + rp < 0.0 || sx - rp >= w as f32 || sy - rp >= h as f32 {
+    for s in &sproj {
+        zmin = zmin.min(s.z - s.r);
+        zmax = zmax.max(s.z + s.r);
+    }
+    {
+        const CHUNK: usize = 4096;
+        let range = std::sync::Mutex::new((zmin, zmax));
+        let chunks: Vec<(&[Tri], &mut [ProjTri])> = scene.tris.chunks(CHUNK).zip(tproj.chunks_mut(CHUNK)).collect();
+        par_each(chunks, |_, (tris, out)| {
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for (t, o) in tris.iter().zip(out.iter_mut()) {
+                let (p, zlo, zhi) = project_tri(t, &rot, cam.center, k, cx, cy, w, h);
+                *o = p;
+                lo = lo.min(zlo);
+                hi = hi.max(zhi);
+            }
+            let mut r = range.lock().unwrap();
+            *r = (r.0.min(lo), r.1.max(hi));
+        });
+        (zmin, zmax) = range.into_inner().unwrap();
+    }
+
+    // Bin primitives into the bands of output rows they touch.
+    let rows_per_band = BAND * ss;
+    let nbands = h.div_ceil(rows_per_band).max(1);
+    let mut bins: Vec<Vec<u32>> = vec![Vec::new(); nbands];
+    for (i, s) in sproj.iter().enumerate() {
+        if s.r <= 0.0 || s.x + s.r < 0.0 || s.y + s.r < 0.0 || s.x - s.r >= w as f32 || s.y - s.r >= h as f32 {
             continue;
         }
-        let y0 = (sy - rp).floor().max(0.0) as usize;
-        let y1 = ((sy + rp).ceil() as usize).min(h - 1);
-        let r2 = rp * rp;
-        for y in y0..=y1 {
-            let dy = y as f32 + 0.5 - sy;
-            let half2 = r2 - dy * dy;
-            if half2 <= 0.0 {
-                continue;
-            }
-            let half = half2.sqrt();
-            let x0 = (sx - half).ceil().max(0.0) as usize;
-            let x1 = ((sx + half).floor().max(0.0) as usize).min(w - 1);
-            let row = y * w;
-            for x in x0..=x1 {
-                let dx = x as f32 + 0.5 - sx;
-                let d2 = half2 - dx * dx;
-                if d2 < 0.0 {
-                    continue;
-                }
-                let z = sz + d2.sqrt();
-                let ix = row + x;
-                if z > depth[ix] {
-                    depth[ix] = z;
-                    owner[ix] = i as u32;
-                }
-            }
+        let y0 = (s.y - s.r).floor().max(0.0) as usize;
+        let y1 = ((s.y + s.r).ceil() as usize).min(h - 1);
+        for bin in &mut bins[y0 / rows_per_band..=y1 / rows_per_band] {
+            bin.push(i as u32);
+        }
+    }
+    for (i, t) in tproj.iter().enumerate() {
+        if t.y0 > t.y1 {
+            continue;
+        }
+        for bin in &mut bins[t.y0 as usize / rows_per_band..=t.y1 as usize / rows_per_band] {
+            bin.push((ns + i) as u32);
         }
     }
 
-    // Light from the upper left, in front.
+    // Rasterize: the nearest surface per pixel, and what it belongs to.
+    let mut depth = vec![f32::NEG_INFINITY; w * h];
+    let mut owner = vec![u32::MAX; w * h];
+    {
+        let bands: Vec<(&mut [f32], &mut [u32])> =
+            depth.chunks_mut(rows_per_band * w).zip(owner.chunks_mut(rows_per_band * w)).collect();
+        par_each(bands, |b, (depth, owner)| {
+            let top = b * rows_per_band;
+            let bottom = top + depth.len() / w; // exclusive
+            for &id in &bins[b] {
+                let id_us = id as usize;
+                if id_us < ns {
+                    raster_sphere(&sproj[id_us], id, top, bottom, w, depth, owner);
+                } else {
+                    raster_tri(&tproj[id_us - ns], id, top, bottom, w, depth, owner);
+                }
+            }
+        });
+    }
+
+    // Shade each supersampled pixel and average down to the output, band by band.
     let light = normalize([-0.45, 0.55, 0.7]);
     let half_vec = normalize([light[0], light[1], light[2] + 1.0]);
     let zspan = (zmax - zmin).max(1e-3);
     // Neighbours this much nearer (in ångströms) draw an outline: the edges of strands
     // and helices that pass in front of others.
     let edge = 1.6 * k;
-    let mut shaded = vec![bg; n];
-    for y in 0..h {
-        for x in 0..w {
-            let ix = y * w + x;
-            let o = owner[ix];
-            if o == u32::MAX {
-                continue;
-            }
-            let (sx, sy, _, rp) = proj[o as usize];
-            let nx = (x as f32 + 0.5 - sx) / rp;
-            let ny = -(y as f32 + 0.5 - sy) / rp;
-            let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
-            let nrm = [nx, ny, nz];
-            let diffuse = dot(nrm, light).max(0.0);
-            let spec = dot(nrm, half_vec).max(0.0).powi(40) * 0.35;
-            let base = spheres[o as usize].color;
-            let lit = 0.3 + 0.7 * diffuse;
-            let mut c = [base[0] * lit + spec, base[1] * lit + spec, base[2] * lit + spec];
-            // Depth cue: the far side fades toward the background.
-            let fog = ((zmax - depth[ix]) / zspan).clamp(0.0, 1.0);
-            c = mix(c, bg, fog * 0.55);
-            // Outline where the surface steps back or meets the background.
-            let z = depth[ix];
-            let step = ss;
-            let behind = |nx: isize, ny: isize| {
-                if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
-                    return true;
-                }
-                let j = ny as usize * w + nx as usize;
-                owner[j] == u32::MAX || z - depth[j] > edge
-            };
-            let (xi, yi, s) = (x as isize, y as isize, step as isize);
-            if behind(xi + s, yi) || behind(xi - s, yi) || behind(xi, yi + s) || behind(xi, yi - s) {
-                c = mix(c, outline, 0.8);
-            }
-            shaded[ix] = c;
-        }
-    }
-
-    // Downsample to the output size.
     let mut bgra = vec![0u8; width * height * 4];
     let mut residues = vec![NO_RESIDUE; width * height];
-    let inv = 1.0 / (ss * ss) as f32;
-    let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = [0.0f32; 3];
-            for sy in 0..ss {
-                let row = (y * ss + sy) * w + x * ss;
-                for sx in 0..ss {
-                    let c = shaded[row + sx];
-                    acc[0] += c[0];
-                    acc[1] += c[1];
-                    acc[2] += c[2];
+    let residue_of = |o: u32| if (o as usize) < ns { spheres[o as usize].residue } else { scene.tris[o as usize - ns].residue };
+    let shade = |x: usize, y: usize| -> V3 {
+        let ix = y * w + x;
+        let o = owner[ix];
+        if o == u32::MAX {
+            return bg;
+        }
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        let (nrm, base) = if (o as usize) < ns {
+            let s = &sproj[o as usize];
+            let nx = (px - s.x) / s.r;
+            let ny = -(py - s.y) / s.r;
+            let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+            ([nx, ny, nz], spheres[o as usize].color)
+        } else {
+            let ti = o as usize - ns;
+            let (t, p) = (&scene.tris[ti], &tproj[ti]);
+            let b = [plane(&p.bary[0], px, py).max(0.0), plane(&p.bary[1], px, py).max(0.0), plane(&p.bary[2], px, py).max(0.0)];
+            let mut nm = [0.0; 3];
+            let mut col = [0.0; 3];
+            for v in 0..3 {
+                for d in 0..3 {
+                    nm[d] += p.n[v][d] * b[v];
+                    col[d] += t.color[v][d] * b[v];
                 }
             }
-            let o = (y * width + x) * 4;
-            bgra[o] = to_byte(acc[2] * inv);
-            bgra[o + 1] = to_byte(acc[1] * inv);
-            bgra[o + 2] = to_byte(acc[0] * inv);
-            bgra[o + 3] = 255;
-            let centre = owner[(y * ss + ss / 2) * w + x * ss + ss / 2];
-            if centre != u32::MAX {
-                residues[y * width + x] = spheres[centre as usize].residue;
+            let mut nm = normalize(nm);
+            // Ribbons are seen from both sides.
+            if nm[2] < 0.0 {
+                nm = scale(nm, -1.0);
+            }
+            (nm, col)
+        };
+        let diffuse = dot(nrm, light).max(0.0);
+        let spec = dot(nrm, half_vec).max(0.0).powi(40) * 0.35;
+        let lit = 0.3 + 0.7 * diffuse;
+        let mut c = [base[0] * lit + spec, base[1] * lit + spec, base[2] * lit + spec];
+        // Depth cue: the far side fades toward the background.
+        let z = depth[ix];
+        let fog = ((zmax - z) / zspan).clamp(0.0, 1.0);
+        c = mix(c, bg, fog * 0.55);
+        // Outline where the surface steps back or meets the background.
+        let behind = |nx: isize, ny: isize| {
+            if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+                return true;
+            }
+            let j = ny as usize * w + nx as usize;
+            owner[j] == u32::MAX || z - depth[j] > edge
+        };
+        let (xi, yi, s) = (x as isize, y as isize, ss as isize);
+        if behind(xi + s, yi) || behind(xi - s, yi) || behind(xi, yi + s) || behind(xi, yi - s) {
+            c = mix(c, outline, 0.8);
+        }
+        c
+    };
+    {
+        let bands: Vec<(&mut [u8], &mut [u32])> = bgra.chunks_mut(BAND * width * 4).zip(residues.chunks_mut(BAND * width)).collect();
+        let inv = 1.0 / (ss * ss) as f32;
+        let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        par_each(bands, |b, (bgra, residues)| {
+            let y_out0 = b * BAND;
+            for (ry, (row_px, row_res)) in bgra.chunks_mut(width * 4).zip(residues.chunks_mut(width)).enumerate() {
+                let y = y_out0 + ry;
+                for x in 0..width {
+                    let mut acc = [0.0f32; 3];
+                    for sy in 0..ss {
+                        for sx in 0..ss {
+                            let c = shade(x * ss + sx, y * ss + sy);
+                            acc[0] += c[0];
+                            acc[1] += c[1];
+                            acc[2] += c[2];
+                        }
+                    }
+                    let o = x * 4;
+                    row_px[o] = to_byte(acc[2] * inv);
+                    row_px[o + 1] = to_byte(acc[1] * inv);
+                    row_px[o + 2] = to_byte(acc[0] * inv);
+                    row_px[o + 3] = 255;
+                    let centre = owner[(y * ss + ss / 2) * w + x * ss + ss / 2];
+                    if centre != u32::MAX {
+                        row_res[x] = residue_of(centre);
+                    }
+                }
+            }
+        });
+    }
+    Frame { width, height, bgra, residues }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The triangle on screen, and the range of depths it spans (culled or not, so the
+/// fog doesn't shift as faces turn away).
+fn project_tri(t: &Tri, rot: &M3, center: V3, k: f32, cx: f32, cy: f32, w: usize, h: usize) -> (ProjTri, f32, f32) {
+    let mut out = ProjTri { y0: 1, y1: 0, ..Default::default() };
+    let mut s = [[0.0f32; 3]; 3];
+    for (sv, p) in s.iter_mut().zip(t.v) {
+        let v = mat_vec(rot, sub(p, center));
+        *sv = [cx + v[0] * k, cy - v[1] * k, v[2] * k];
+    }
+    let zlo = s[0][2].min(s[1][2]).min(s[2][2]);
+    let zhi = s[0][2].max(s[1][2]).max(s[2][2]);
+    let [a, b, c] = s;
+    let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    // The cartoon is a closed surface wound outward, so faces turned away (positive
+    // area once y points down) are hidden behind others; skip them and slivers.
+    if area > -1e-6 {
+        return (out, zlo, zhi);
+    }
+    let xmin = a[0].min(b[0]).min(c[0]);
+    let xmax = a[0].max(b[0]).max(c[0]);
+    let ymin = a[1].min(b[1]).min(c[1]);
+    let ymax = a[1].max(b[1]).max(c[1]);
+    if xmax < 0.5 || ymax < 0.5 || xmin >= w as f32 - 0.5 || ymin >= h as f32 - 0.5 {
+        return (out, zlo, zhi);
+    }
+    let x0 = (xmin - 0.5).ceil().max(0.0);
+    let x1 = (xmax - 0.5).floor().min(w as f32 - 1.0);
+    let y0 = (ymin - 0.5).ceil().max(0.0);
+    let y1 = (ymax - 0.5).floor().min(h as f32 - 1.0);
+    if x0 > x1 || y0 > y1 {
+        return (out, zlo, zhi);
+    }
+    // Weight of vertex i: the edge opposite it, over the area.
+    let inv = 1.0 / area;
+    let edge = |p: V3, q: V3| [(p[1] - q[1]) * inv, (q[0] - p[0]) * inv, (p[0] * q[1] - p[1] * q[0]) * inv];
+    let bary = [edge(b, c), edge(c, a), edge(a, b)];
+    let mut z = [0.0; 3];
+    for (v, wv) in bary.iter().enumerate() {
+        for d in 0..3 {
+            z[d] += wv[d] * s[v][2];
+        }
+    }
+    out.bary = bary;
+    out.z = z;
+    out.n = t.n.map(|n| mat_vec(rot, n));
+    out.x0 = x0 as u32;
+    out.x1 = x1 as u32;
+    out.y0 = y0 as u32;
+    out.y1 = y1 as u32;
+    (out, zlo, zhi)
+}
+
+fn raster_tri(t: &ProjTri, id: u32, top: usize, bottom: usize, w: usize, depth: &mut [f32], owner: &mut [u32]) {
+    let y0 = (t.y0 as usize).max(top);
+    let y1 = (t.y1 as usize).min(bottom - 1);
+    for y in y0..=y1 {
+        let py = y as f32 + 0.5;
+        // Solve each weight >= 0 for the span of x it allows on this row.
+        let (mut lo, mut hi) = (t.x0 as f32 + 0.5, t.x1 as f32 + 0.5);
+        for e in &t.bary {
+            let c = e[1] * py + e[2];
+            if e[0].abs() < 1e-12 {
+                if c < 0.0 {
+                    lo = f32::INFINITY;
+                }
+            } else if e[0] > 0.0 {
+                lo = lo.max(-c / e[0]);
+            } else {
+                hi = hi.min(-c / e[0]);
+            }
+        }
+        if lo > hi {
+            continue;
+        }
+        let xa = ((lo - 0.5).ceil().max(t.x0 as f32)) as usize;
+        let xb = ((hi - 0.5).floor().min(t.x1 as f32)) as usize;
+        if xa > xb {
+            continue;
+        }
+        let row = (y - top) * w;
+        let mut z = plane(&t.z, xa as f32 + 0.5, py);
+        let dz = t.z[0];
+        for x in xa..=xb {
+            let ix = row + x;
+            if z > depth[ix] {
+                depth[ix] = z;
+                owner[ix] = id;
+            }
+            z += dz;
+        }
+    }
+}
+
+fn raster_sphere(s: &ProjSphere, id: u32, top: usize, bottom: usize, w: usize, depth: &mut [f32], owner: &mut [u32]) {
+    let y0 = ((s.y - s.r).floor().max(0.0) as usize).max(top);
+    let y1 = ((s.y + s.r).ceil() as usize).min(bottom - 1);
+    let r2 = s.r * s.r;
+    for y in y0..=y1 {
+        let dy = y as f32 + 0.5 - s.y;
+        let half2 = r2 - dy * dy;
+        if half2 <= 0.0 {
+            continue;
+        }
+        let half = half2.sqrt();
+        let x0 = (s.x - half).ceil().max(0.0) as usize;
+        let x1 = ((s.x + half).floor().max(0.0) as usize).min(w - 1);
+        let row = (y - top) * w;
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - s.x;
+            let d2 = half2 - dx * dx;
+            if d2 < 0.0 {
+                continue;
+            }
+            let z = s.z + d2.sqrt();
+            let ix = row + x;
+            if z > depth[ix] {
+                depth[ix] = z;
+                owner[ix] = id;
             }
         }
     }
-    Frame { width, height, bgra, residues }
 }
 
 #[cfg(test)]
@@ -547,7 +1033,7 @@ mod tests {
             Sphere { c: [0.0, 0.0, 5.0], r: 1.0, color: [0.0, 0.0, 1.0], residue: 9 },
         ];
         let cam = Camera { rot: IDENTITY, center: [0.0; 3], scale: 10.0, pan: (0.0, 0.0) };
-        let f = render(&spheres, &cam, 64, 64, 2, [0.0; 3], [0.0; 3]);
+        let f = render(&Scene { spheres: spheres.to_vec(), tris: Vec::new() }, &cam, 64, 64, 2, [0.0; 3], [0.0; 3]);
         assert_eq!(f.residue_at(32.0, 32.0), Some(9), "the front sphere covers the middle");
         assert_eq!(f.residue_at(32.0 + 15.0, 32.0), Some(7));
         assert_eq!(f.residue_at(1.0, 1.0), None);
@@ -555,6 +1041,35 @@ mod tests {
         let px = |x: usize, y: usize| &f.bgra[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
         assert!(px(32, 30)[0] > px(32, 30)[2]);
         assert_eq!(px(0, 0), &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn triangles_depth_test_against_spheres() {
+        let n = [0.0, 0.0, 1.0];
+        let tri = Tri { v: [[-3.0, -3.0, 2.0], [3.0, -3.0, 2.0], [0.0, 3.0, 2.0]], n: [n; 3], color: [[0.0, 1.0, 0.0]; 3], residue: 4 };
+        let sphere = Sphere { c: [0.0, 0.0, 0.0], r: 1.0, color: [1.0, 0.0, 0.0], residue: 7 };
+        let cam = Camera { rot: IDENTITY, center: [0.0; 3], scale: 10.0, pan: (0.0, 0.0) };
+        let f = render(&Scene { spheres: vec![sphere], tris: vec![tri] }, &cam, 64, 64, 2, [0.0; 3], [0.0; 3]);
+        assert_eq!(f.residue_at(32.0, 32.0), Some(4), "the triangle is in front of the sphere");
+        assert_eq!(f.residue_at(5.0, 5.0), None, "beside the triangle's apex");
+        let px = &f.bgra[(32 * 64 + 32) * 4..(32 * 64 + 32) * 4 + 4];
+        assert!(px[1] > px[2] && px[1] > px[0], "lit green: {px:?}");
+    }
+
+    #[test]
+    fn cartoon_meshes_egfp() {
+        use crate::pgx::StructureFormat;
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/samples/2Y0G.pdb")).unwrap();
+        let mol = Molecule::parse(&bytes, StructureFormat::Pdb).unwrap();
+        assert!(mol.residues.iter().filter(|r| r.carbonyl.is_some()).count() > 200);
+        let colors = residue_colors(&mol, Coloring::Secondary, false, &[]);
+        let scene = build_scene(&mol, Style::Cartoon, &colors, &[], [1.0; 3]);
+        assert!(scene.tris.len() > 10_000);
+        let finite = |v: &V3| v.iter().all(|c| c.is_finite());
+        for t in &scene.tris {
+            assert!((t.residue as usize) < mol.residues.len());
+            assert!(t.v.iter().all(finite) && t.n.iter().all(finite) && t.color.iter().all(finite));
+        }
     }
 
     #[test]
@@ -606,18 +1121,57 @@ mod preview {
             highlight[r] = (60..=70).contains(&res.seq_num);
         }
         for (name, style, coloring) in [
+            ("cartoon-rainbow", Style::Cartoon, Coloring::Rainbow),
+            ("cartoon-ss", Style::Cartoon, Coloring::Secondary),
             ("tube-rainbow", Style::Tube, Coloring::Rainbow),
             ("tube-ss", Style::Tube, Coloring::Secondary),
             ("atoms-rainbow", Style::Atoms, Coloring::Rainbow),
         ] {
             let colors = residue_colors(&mol, coloring, false, &[]);
-            let spheres = build_spheres(&mol, style, &colors, &highlight, [1.0, 0.8, 0.2]);
-            let cam = Camera { rot, center, scale: 9.0, pan: (0.0, 0.0) };
+            let scene = build_scene(&mol, style, &colors, &highlight, [1.0, 0.8, 0.2]);
+            let zoom: f32 = std::env::var("RENDER_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(9.0);
+            let cam = Camera { rot, center, scale: zoom, pan: (0.0, 0.0) };
             let t = std::time::Instant::now();
-            let f = render(&spheres, &cam, 800, 600, 2, bg, [0.03; 3]);
-            eprintln!("{name}: {} spheres, {:?}", spheres.len(), t.elapsed());
+            let f = render(&scene, &cam, 800, 600, 2, bg, [0.03; 3]);
+            eprintln!("{name}: {} spheres, {} triangles, {:?}", scene.spheres.len(), scene.tris.len(), t.elapsed());
             let rgba: Vec<u8> = f.bgra.chunks(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
             image::save_buffer(format!("{dir}/2y0g-{name}.png"), &rgba, 800, 600, image::ColorType::Rgba8).unwrap();
+        }
+    }
+}
+
+/// `cargo test --release -- --ignored render_bench --nocapture`: milliseconds per frame
+/// for the EGFP structure while it turns, at a typical panel size.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::pgx::StructureFormat;
+
+    #[test]
+    #[ignore]
+    fn render_bench() {
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/samples/2Y0G.pdb")).unwrap();
+        let mol = Molecule::parse(&bytes, StructureFormat::Pdb).unwrap();
+        let trace: Vec<V3> = mol.residues.iter().filter_map(|r| r.trace).map(|t| mol.atoms[t].pos).collect();
+        let n = trace.len() as f32;
+        let center = [0, 1, 2].map(|d| trace.iter().map(|p| p[d]).sum::<f32>() / n);
+        let (w, h) = (1600, 1000);
+        for style in [Style::Cartoon, Style::Tube, Style::Atoms] {
+            let colors = residue_colors(&mol, Coloring::Rainbow, false, &[]);
+            let t = std::time::Instant::now();
+            let scene = build_scene(&mol, style, &colors, &[], [1.0; 3]);
+            let build = t.elapsed();
+            for ss in [1, 2] {
+                let mut rot = principal_axes(&trace, center);
+                let frames = 20;
+                let t = std::time::Instant::now();
+                for _ in 0..frames {
+                    rot = rotate(&rot, 0.05, 0.0);
+                    let cam = Camera { rot, center, scale: h as f32 * 0.92 / 50.0, pan: (0.0, 0.0) };
+                    std::hint::black_box(render(&scene, &cam, w, h, ss, [0.1; 3], [0.0; 3]));
+                }
+                eprintln!("{style:?} ss={ss}: {:.1} ms/frame (scene built in {build:?})", t.elapsed().as_secs_f64() * 1000.0 / frames as f64);
+            }
         }
     }
 }

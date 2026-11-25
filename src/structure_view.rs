@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     canvas, div, prelude::*, px, App, Bounds, Context, Corners, Entity, HitboxBehavior, Hsla, MouseButton, MouseDownEvent,
@@ -21,11 +22,26 @@ use crate::attach_dialog::{AttachDialog, AttachEvent};
 use crate::editor::SeqEditor;
 use crate::pgx::{ChainLinking, Structure};
 use crate::structure::{self, ChainLink, Molecule, StructureFile};
-use crate::structure_render::{self as render, Camera, Coloring, Frame, Sphere, Style, M3, V3};
+use crate::structure_render::{self as render, Camera, Coloring, Frame, Scene, Style, M3, V3};
 use crate::theme;
 
 /// Supersample the idle image while it has fewer device pixels than this.
 const SUPERSAMPLE_BELOW: usize = 1_600_000;
+/// While the view moves (dragging, rocking, rotating), render at most this many device
+/// pixels and let the image be scaled up, so large panels keep up with the display.
+const MOVING_PIXELS: usize = 2_000_000;
+/// Rotate: radians per second about the vertical axis.
+const ROTATE_SPEED: f32 = std::f32::consts::TAU / 14.0;
+/// Rock: swing either side of the starting orientation, and the period of a swing.
+const ROCK_ANGLE: f32 = 0.3;
+const ROCK_PERIOD: f32 = 6.4;
+
+/// A continuous motion of the view, for looking at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spin {
+    Rock,
+    Rotate,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 struct View {
@@ -94,11 +110,15 @@ pub struct StructureView {
     view: Option<View>,
     loaded: HashMap<String, Result<Rc<Loaded>, SharedString>>,
     links: Option<(String, Links)>,
-    scene: Option<(SceneKey, Rc<Vec<Sphere>>)>,
+    scene: Option<(SceneKey, Rc<Scene>)>,
     image: Option<Image>,
     viewport: Rc<Cell<(f32, f32)>>,
     drag: Rc<Cell<Option<Drag>>>,
     hover: Option<usize>,
+    spin: Option<Spin>,
+    /// When the spin last advanced, and how far through its swing a rock is (radians).
+    spin_clock: Option<Instant>,
+    rock_phase: f32,
     notice: Option<SharedString>,
     loading: bool,
     /// The open Attach Structure / Link Chains dialog.
@@ -119,7 +139,7 @@ impl StructureView {
         Self {
             editor,
             current: None,
-            style: Style::Tube,
+            style: Style::Cartoon,
             coloring: Coloring::Rainbow,
             view: None,
             loaded: HashMap::new(),
@@ -129,6 +149,9 @@ impl StructureView {
             viewport: Rc::new(Cell::new((0.0, 0.0))),
             drag: Rc::new(Cell::new(None)),
             hover: None,
+            spin: None,
+            spin_clock: None,
+            rock_phase: 0.0,
             notice: None,
             loading: false,
             dialog: None,
@@ -215,6 +238,37 @@ impl StructureView {
     fn set_coloring(&mut self, coloring: Coloring, cx: &mut Context<Self>) {
         self.coloring = coloring;
         cx.notify();
+    }
+
+    /// Start `spin`, or stop it if it's already going.
+    fn toggle_spin(&mut self, spin: Spin, cx: &mut Context<Self>) {
+        self.spin = if self.spin == Some(spin) { None } else { Some(spin) };
+        self.spin_clock = None;
+        self.rock_phase = 0.0;
+        cx.notify();
+    }
+
+    /// Turn the view by however much the spin has moved since the last frame, and ask
+    /// for another. A drag holds it still (and steers it) until released.
+    fn advance_spin(&mut self, window: &mut Window) {
+        let Some(spin) = self.spin else { return };
+        let now = Instant::now();
+        let dt = self.spin_clock.map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));
+        self.spin_clock = Some(now);
+        window.request_animation_frame();
+        if self.drag.get().is_some_and(|d| d.moved) {
+            return;
+        }
+        let Some(view) = self.view.as_mut() else { return };
+        let turn = match spin {
+            Spin::Rotate => ROTATE_SPEED * dt,
+            Spin::Rock => {
+                let before = ROCK_ANGLE * self.rock_phase.sin();
+                self.rock_phase = (self.rock_phase + std::f32::consts::TAU / ROCK_PERIOD * dt) % std::f32::consts::TAU;
+                ROCK_ANGLE * self.rock_phase.sin() - before
+            }
+        };
+        view.rot = render::rotate(&view.rot, turn, 0.0);
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
@@ -419,7 +473,7 @@ impl StructureView {
 
     // ----- drawing -------------------------------------------------------------------
 
-    fn scene(&mut self, s: &Structure, loaded: &Loaded, cx: &App) -> (SceneKey, Rc<Vec<Sphere>>) {
+    fn scene(&mut self, s: &Structure, loaded: &Loaded, cx: &App) -> (SceneKey, Rc<Scene>) {
         let ed = self.editor.read(cx);
         let sel = ed.selection();
         let len = ed.doc.len();
@@ -447,7 +501,7 @@ impl StructureView {
             .collect();
         let feature_colors: Vec<Option<V3>> = spans.iter().map(|sp| sp.and_then(|(_, _, fi)| features.get(fi)).map(|f| v3(theme::feature(&f.kind)))).collect();
         let colors = render::residue_colors(mol, self.coloring, loaded.alphafold, &feature_colors);
-        let spheres = Rc::new(render::build_spheres(mol, self.style, &colors, &highlight, v3(theme::accent())));
+        let spheres = Rc::new(render::build_scene(mol, self.style, &colors, &highlight, v3(theme::accent())));
         self.scene = Some((key.clone(), spheres.clone()));
         (key, spheres)
     }
@@ -460,8 +514,13 @@ impl StructureView {
             return None;
         }
         let view = *self.view.get_or_insert(View { rot: loaded.home, zoom: 1.0, pan: (0.0, 0.0) });
-        let dragging = self.drag.get().is_some_and(|d| d.moved);
-        let ss = if dragging || dw * dh > SUPERSAMPLE_BELOW { 1 } else { 2 };
+        let moving = self.spin.is_some() || self.drag.get().is_some_and(|d| d.moved);
+        let ss = if moving || dw * dh > SUPERSAMPLE_BELOW { 1 } else { 2 };
+        // Fewer pixels while moving, scaled up to fill the view (a panel's own size is
+        // what `scale_factor` stands for below, so shrink it too).
+        let shrink = if moving && dw * dh > MOVING_PIXELS { (MOVING_PIXELS as f32 / (dw * dh) as f32).sqrt() } else { 1.0 };
+        let (dw, dh) = ((dw as f32 * shrink).round() as usize, (dh as f32 * shrink).round() as usize);
+        let scale_factor = scale_factor * shrink;
         let (scene, spheres) = self.scene(s, loaded, cx);
         let key = ImageKey { scene, view, size: (dw, dh), ss };
         if let Some(img) = &self.image {
@@ -473,9 +532,10 @@ impl StructureView {
         let cam = Camera { rot: view.rot, center: loaded.center, scale: fit * view.zoom, pan: (view.pan.0 * scale_factor, view.pan.1 * scale_factor) };
         let bg = v3(theme::editor_bg());
         let frame = render::render(&spheres, &cam, dw, dh, ss, bg, [bg[0] * 0.25, bg[1] * 0.25, bg[2] * 0.25]);
-        let buf = image::RgbaImage::from_raw(dw as u32, dh as u32, frame.bgra.clone())?;
+        let Frame { width, height, bgra, residues } = frame;
+        let buf = image::RgbaImage::from_raw(dw as u32, dh as u32, bgra)?;
         let image = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
-        let frame = Rc::new(Frame { width: frame.width, height: frame.height, bgra: Vec::new(), residues: frame.residues });
+        let frame = Rc::new(Frame { width, height, bgra: Vec::new(), residues });
         if let Some(old) = self.image.replace(Image { key, image: image.clone(), frame: frame.clone() }) {
             // While rendering, this window is leased out of the app's window list, so
             // `drop_image` only reaches its sprite atlas through the explicit argument.
@@ -537,7 +597,7 @@ impl StructureView {
             bar = bar.child(div().text_color(theme::text()).child(s.source.clone().unwrap_or_else(|| s.name.clone())));
         }
 
-        let styles = [(Style::Tube, "Tube"), (Style::Atoms, "Atoms")];
+        let styles = [(Style::Cartoon, "Cartoon"), (Style::Tube, "Tube"), (Style::Atoms, "Atoms")];
         let mut style_group = group();
         for (st, label) in styles {
             style_group = style_group.child(
@@ -557,8 +617,15 @@ impl StructureView {
                 segment(format!("color-{label}").into(), label, self.coloring == c).on_click(cx.listener(move |v, _, _, cx| v.set_coloring(c, cx))),
             );
         }
+        let mut spin_group = group();
+        for (spin, label) in [(Spin::Rock, "Rock"), (Spin::Rotate, "Rotate")] {
+            spin_group = spin_group.child(
+                segment(format!("spin-{label}").into(), label, self.spin == Some(spin)).on_click(cx.listener(move |v, _, _, cx| v.toggle_spin(spin, cx))),
+            );
+        }
         bar.child(style_group)
             .child(color_group)
+            .child(spin_group)
             .child(div().flex_1())
             .child(button("reset-view", "Reset").on_click(cx.listener(|v, _, _, cx| v.reset_view(cx))))
             .when(!all.is_empty(), |d| d.child(button("relink", "Link Chains…").on_click(cx.listener(|v, _, window, cx| v.relink(window, cx)))))
@@ -640,6 +707,7 @@ impl Render for StructureView {
         };
         let mol = loaded.mol.clone();
 
+        self.advance_spin(window);
         let image = self.image(&s, &loaded, window, cx);
 
         // Footer: which chains line up with which CDS, and what's under the mouse.
