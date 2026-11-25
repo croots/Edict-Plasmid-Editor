@@ -2,6 +2,8 @@
 
 Edict is a fast, GPU-rendered editor for plasmids and other DNA sequences, built on [GPUI](https://crates.io/crates/gpui) (Zed's UI framework). It opens GenBank, FASTA and SnapGene files and saves to its own `.edna` format, which keeps a full edit history and attached 3D structures alongside the sequence.
 
+![Edict editing pEGFP-N1: the sequence with its translated features, the EGFP crystal structure (PDB 2Y0G) linked to the CDS, and a circular map](docs/screenshot.png)
+
 Edict is free for noncommercial academic use. See [License](#license).
 
 ## Run
@@ -11,28 +13,8 @@ nix develop                     # Rust toolchain, Zig 0.17 (for libghostty-vt), 
 cargo run --release -- samples  # explorer root; optional second arg opens a file
 ```
 
-### ESMFold2 (structure prediction)
-
-The usual way to run ESMFold2 is the bundled plugin. Install it from Settings → Plugins,
-then right-click a CDS or ORF → Plugins → Predict structure with ESMFold2…. It runs in this
-flake's `esmfold2-env`. The CLI below uses the same build.
-
-`nix/esmfold2.nix` builds Biohub's [`esm`](https://github.com/Biohub/esm) 3.5.0 against nixpkgs'
-ROCm torch (prebuilt on cache.nixos.org; ~5 GB download) and wraps it in `esmfold2-predict`:
-
-```sh
-nix run .#esmfold2 -- -s MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG -o ubq.cif
-nix run .#esmfold2 -- -f chains.fasta -o complex.cif --model biohub/ESMFold2   # each record is a chain
-nix develop .#esmfold2          # Python with `esm` importable
-nix build .#esmfold2-env        # just that Python (what the plugin runs in)
-nix build .#esmfold2-cpu        # torch without ROCm (very slow for a 7B model)
-```
-
-It writes mmCIF (which `src/structure.rs` reads) and prints one JSON object on stdout
-(`ptm`, `iptm`, `plddt_mean`, per-token `plddt`, `seconds`); progress goes to stderr. The weights
-(~26 GB per model, MIT) download from Hugging Face into `$HF_HOME` on first run. The folding trunk
-stays fp32; on ROCm the 6B ESMC language model runs in bf16 rather than esm's default fp8 (RDNA3
-reports capability 11.0, which esm's fp8 check would otherwise accept but cannot run).
+More documentation is in [`docs/`](docs/README.md): [writing plugins](docs/plugins.md),
+[ESMFold2 structure prediction](docs/esmfold2.md) and [the `.edna` format](docs/edna-format.md).
 
 ## What it does
 
@@ -69,12 +51,12 @@ reports capability 11.0, which esm's fp8 check would otherwise accept but cannot
     - an editable `/note`: "Identified by BLASTX against nr on 2026-11-23 by ‹author›: …, 98.8% identity over 240 aa, E-value 3e-150."
 
   Results live in memory only. NCBI keeps its own report for about 36 hours.
-- **Plugins** (right-click a feature → Plugins): Python scripts that act on a feature. The two bundled ones predict a protein's structure (ESMFold2, and an ideal-helix demo that needs nothing installed). Each lives in `~/.config/edict/plugins/<id>/plugin.py` and says in its header which Python environments it can run in (uv, venv, conda, nix or a plain interpreter), what it offers, and its settings. Running one works like BLAST:
+- **Plugins** (right-click a feature → Plugins): Python scripts that act on a feature, such as predicting a protein's structure. Edict installs none: each plugin is a standalone folder you add yourself (this repository keeps one, [ESMFold2](docs/esmfold2.md)). Each lives in `~/.config/edict/plugins/<id>/plugin.py` and says in its header which Python environments it can run in (uv, venv, conda, nix or a plain interpreter), what it offers, and its settings. Running one works like BLAST:
   - a settings form, remembered between runs
   - the plugin's live terminal output, which you can background or cancel (cancelling stops its child processes too)
   - a result card with its scores (pTM, pLDDT) and a per-residue confidence strip, from which you **Attach** the structure to the feature (it opens in a 3D pane, coloured by confidence), **Save** the file, or dismiss it
 
-  A memory guard stops a run before the machine runs out of RAM. **Settings → Plugins** lists the installed plugins, which environment each will use (and lets you pick another), and any that failed to load; it also installs the bundled ones. [`plugins/README.md`](plugins/README.md) explains how to write one.
+  A memory guard stops a run before the machine runs out of RAM. **Settings → Plugins** lists the installed plugins, which environment each will use (and lets you pick another), and any that failed to load. [`docs/plugins.md`](docs/plugins.md) explains how to write one.
 - **Locked regions**: the bases a task is using stay locked until its results are dismissed, or until it fails or is cancelled. This keeps results from drifting out of step with the sequence.
   - Locked bases are tinted with a bar above them, and shown as a band on maps.
   - Typing, deleting, pasting, cutting, undo/redo and reverts that would change them are refused, with a note in the status bar.
@@ -109,12 +91,12 @@ reports capability 11.0, which esm's fp8 check would otherwise accept but cannot
 | `src/blast/mod.rs` | The NCBI BLAST URL API: options and their per-program defaults, the Put form, RID/status parsing, JSON2_S results, request throttling. Unit-tested; `cargo test live_search -- --ignored` with `BLAST_EMAIL` set runs a real search. |
 | `src/blast/results.rs` | Hit table sorting, NCBI-style alignment blocks, and the feature a match becomes. Unit-tested. |
 | `src/blast/dialog.rs` | The BLAST task's view: options form, run log, results table and alignments. |
-| `src/plugins/mod.rs` | The plugin registry: scanning the plugins folder, the actions offered for a feature kind, installing the bundled plugins. Unit-tested. |
+| `src/plugins/mod.rs` | The plugin registry: scanning the plugins folder, the actions offered for a feature kind. Unit-tested. |
 | `src/plugins/manifest.rs` | Reading a plugin's `[tool.edict]` header: environments, actions, typed settings. Unit-tested. |
 | `src/plugins/env.rs` | Turning an environment entry (uv, venv, conda, nix, python) into a command, or saying why it isn't usable. Unit-tested. |
 | `src/plugins/runner.rs` | Running a plugin as a task: scratch folder, pty, the event stream, cancelling the process group, checking the result. Tested against real Python when it is on `PATH`. |
 | `src/plugins/form.rs`, `dialog.rs` | The settings form built from the manifest, and the plugin task's view: form, terminal, result card, attach and save. |
-| `plugins/` | The bundled plugins (`esmfold2`, `ideal-helix`), the `edict.py` helper the app gives every run, and [the guide to writing one](plugins/README.md). |
+| `plugins/` | The `esmfold2` plugin (install it yourself; see [docs/esmfold2.md](docs/esmfold2.md)) and the `edict.py` helper the app gives every run. |
 | `src/about.rs` | About panel: version, third-party notices and the crate license table. |
 | `licenses/` | License texts shown in About. `rust-crates.tsv` lists every linked Rust crate; regenerate it with `scripts/licenses.sh` after changing dependencies. |
 | `src/theme.rs` | Active theme (thread-local), base16 → UI color mapping, YAML scheme parser, bundled and custom theme loading. Unit-tested. |
@@ -129,29 +111,6 @@ The font defaults to DejaVu Sans Mono (Menlo on macOS). Override it with `EDICT_
 Map zoom and pan, translations and ORFs, restriction sites, feature editing UI, the explorer's search box (GPUI needs a hand-built text input), multi-record files, alignments (the `.edna` format reserves `alignments/` and ties each one to a revision, so edits mark it stale), autoscroll while drag-selecting past the viewport edge.
 
 BLAST: these parameters are what NCBI's web form and other clients send, but NCBI's URL API page doesn't list them, so treat them as unverified: `ENTREZ_QUERY` (organism limits), `EXCLUDE_MODELS`, `EXCLUDE_SEQ_UNCULT`, `LCASE_MASK`, `QUERY_GENETIC_CODE`/`GENETIC_CODE`, `JOB_TITLE`, the discontiguous-megablast `TEMPLATE_TYPE`/`TEMPLATE_LENGTH`, the `R` (repeats) filter letter, and polling with `FORMAT_OBJECT=SearchInfo`. Check them with a live search.
-
-## The `.edna` format
-
-A zip archive (like ODF or EPUB), so any unzip tool can open it:
-
-```text
-mimetype               first entry, stored uncompressed: application/vnd.edict.edna+zip
-manifest.json          {format: "edna", format_version, app_version, revision}
-sequence.json          source of truth: sequence, topology, features (+ qualifiers), record metadata
-sequence.gb            GenBank copy for other tools; regenerated on every save and never read back
-history/ops.jsonl      one change per line: {rev, time, author?, op, …}: insert|delete {pos, bases},
-                       add_feature|remove_feature {ix, feature}, edit_feature {ix, before, after},
-                       attach_structure, remove_structure, link_structure, rename, revert {to},
-                       features {changed?, all?} (bookkeeping: the features a base edit cut, dropped
-                       or re-translated, as they were, so features read back exactly)
-history/revisions.json save points: [{rev, time, author?, label?}]
-```
-
-- **Revisions.** Every change a save keeps (bases, features, structures, the record name), including undo and redo, gets a revision number and the name of whoever made it. Structure files themselves live under `structures/`, not in the log. Each sequence edit stores the bases it inserted or removed, so the log can be replayed backwards from `sequence.json` to any earlier revision; together with the `features` records, that gives back the exact bases and features of any revision. (Logs written before `features` records existed give back exact bases, and features as close as the log allows.)
-- **Format versions.** A reader refuses a file with a newer `format_version` instead of guessing at it. Version 2 added the non-sequence changes and authors to the log; version 1 files still open.
-- **Unknown entries.** A reader keeps entries it doesn't recognise and writes them back on save. An older build never strips data a newer one added.
-- **Stale data.** Anything tied to coordinates (alignments, later) records the revision it was made against. If that differs from `manifest.json`'s revision, it is stale.
-- **Safe reading.** Entries are read in memory and size-capped. Nothing is extracted to disk.
 
 `samples/sample-d.dna` is a test file from [Biopython](https://github.com/biopython/biopython/tree/master/Tests/SnapGene) (Biopython License / BSD 3-Clause).
 

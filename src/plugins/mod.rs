@@ -17,16 +17,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
 use gpui::{App, Global};
 
 use manifest::{Action, EnvSpec, Manifest};
-
-/// Plugins that ship with the app, installed from Settings → Plugins.
-pub const BUNDLED: &[(&str, &str)] = &[
-    ("esmfold2", include_str!("../../plugins/esmfold2/plugin.py")),
-    ("ideal-helix", include_str!("../../plugins/ideal-helix/plugin.py")),
-];
 
 pub struct Plugin {
     pub dir: PathBuf,
@@ -126,52 +120,34 @@ pub fn actions_for(kind: &str, cx: &App) -> Vec<(Arc<Plugin>, Action)> {
         .collect()
 }
 
-/// Write the bundled plugins into `dir`. A changed copy is kept as `plugin.py.bak`.
-/// Returns what was installed or updated.
-pub fn install_bundled(dir: &Path) -> Result<Vec<String>> {
-    let mut done = Vec::new();
-    for (id, source) in BUNDLED {
-        let folder = dir.join(id);
-        let script = folder.join("plugin.py");
-        std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
-        match std::fs::read_to_string(&script) {
-            Ok(old) if old == *source => continue,
-            Ok(old) => {
-                std::fs::write(folder.join("plugin.py.bak"), old)?;
-                done.push(format!("{id} (updated; your copy is plugin.py.bak)"));
-            }
-            Err(_) => done.push(id.to_string()),
-        }
-        crate::model::write_atomic(&script, source.as_bytes())?;
-    }
-    Ok(done)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The ESMFold2 plugin kept in this repository (users copy it in themselves).
+    const ESMFOLD2: &str = include_str!("../../plugins/esmfold2/plugin.py");
+
     #[test]
-    fn bundled_plugins_have_valid_manifests() {
-        for (id, src) in BUNDLED {
-            let m = manifest::parse(src).unwrap_or_else(|e| panic!("{id}: {e:#}"));
-            assert_eq!(m.id, *id);
-        }
+    fn the_esmfold2_plugin_has_a_valid_manifest() {
+        let m = manifest::parse(ESMFOLD2).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(m.id, "esmfold2");
     }
 
     #[test]
-    fn scans_and_installs() {
+    fn scans_a_plugins_folder() {
         let dir = std::env::temp_dir().join(format!("edict-plugins-scan-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join("broken")).unwrap();
-        std::fs::write(dir.join("broken/plugin.py"), "print('no manifest')").unwrap();
-        let installed = install_bundled(&dir).unwrap();
-        assert_eq!(installed.len(), BUNDLED.len());
-        assert!(install_bundled(&dir).unwrap().is_empty(), "a second install changes nothing");
+        for (folder, source) in [("esmfold2", ESMFOLD2), ("copy-of-esmfold2", ESMFOLD2), ("broken", "print('no manifest')")] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+            std::fs::write(dir.join(folder).join("plugin.py"), source).unwrap();
+        }
+        // A folder without a plugin.py is not a plugin, and not a problem either.
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
         let reg = scan(Some(&dir));
-        assert_eq!(reg.plugins.len(), BUNDLED.len());
-        assert_eq!(reg.problems.len(), 1);
-        assert!(reg.problems[0].error.contains("script"));
+        assert_eq!(reg.plugins.len(), 1);
+        assert_eq!(reg.problems.len(), 2);
+        assert!(reg.problems.iter().any(|p| p.error.contains("script")));
+        assert!(reg.problems.iter().any(|p| p.error.contains("already has the id")));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

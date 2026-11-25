@@ -1373,8 +1373,8 @@ impl Workspace {
         let mut list = div().id("plugins-list").flex().flex_col().gap_3().flex_1().min_h_0().overflow_y_scroll();
         if plugins.is_empty() {
             list = list.child(small(
-                "No plugins installed. A plugin is a folder holding a plugin.py; \
-                 Install bundled plugins adds ESMFold2 and a small demo."
+                "No plugins installed. A plugin is a folder holding a plugin.py: \
+                 put one in the folder above (Open folder), then click Rescan."
                     .into(),
             ));
         }
@@ -1454,16 +1454,6 @@ impl Workspace {
                     .child(button("plugins-rescan", "Rescan").on_click(cx.listener(|_, _, _, cx| {
                         crate::plugins::rescan(cx);
                         cx.notify();
-                    })))
-                    .child(button("plugins-install", "Install bundled plugins").on_click(cx.listener(|this, _, _, cx| {
-                        let Some(dir) = crate::plugins::plugins_dir() else { return };
-                        let msg = match crate::plugins::install_bundled(&dir) {
-                            Ok(done) if done.is_empty() => "The bundled plugins are already installed and current.".to_string(),
-                            Ok(done) => format!("Installed {}", done.join(", ")),
-                            Err(e) => format!("Couldn't install the bundled plugins: {e:#}"),
-                        };
-                        crate::plugins::rescan(cx);
-                        this.set_notice(msg, cx);
                     }))),
             )
             .child(list)

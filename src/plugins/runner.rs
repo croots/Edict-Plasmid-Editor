@@ -416,10 +416,8 @@ mod tests {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     }
 
-    #[test]
-    fn a_plugin_gives_a_structure() {
-        let (out, msgs) = run_script(
-            r#"
+    /// A plugin that "predicts" a three-residue CA trace of MKV, the protein `run_script` sends.
+    const MKV_PLUGIN: &str = r#"
 import edict, sys
 CIF = """data_mkv
 loop_
@@ -449,9 +447,11 @@ print("hello from the plugin")
 edict.progress("Folding", 0.5)
 open("pred.cif", "w").write(CIF)
 edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], metrics={"ptm": 0.8}, plddt=[90, 80, 70])
-"#,
-            None,
-        );
+"#;
+
+    #[test]
+    fn a_plugin_gives_a_structure() {
+        let (out, msgs) = run_script(MKV_PLUGIN, None);
         if msgs == ["skipped"] {
             return;
         }
@@ -481,14 +481,36 @@ edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], me
         assert!(out.err().unwrap().to_string().contains("isn't in the run's folder"));
         let (out, _) = run_script("pass\n", None);
         assert!(out.err().unwrap().to_string().contains("without giving a result"));
-        // A structure of some other protein (the demo's helix of "MKVL", not "MKV").
-        let (_, helix) = crate::plugins::BUNDLED.iter().find(|(id, _)| *id == "ideal-helix").unwrap();
-        let wrong = serde_json::json!({"api": 1, "settings": {"rise": 1.5, "delay": "0"},
-            "input": {"sequences": [{"id": "A", "seq": "MKV"}], "feature": {"label": "x", "kind": "CDS"}}});
-        let lying = helix.replace("seq = chain[\"seq\"]", "seq = chain[\"seq\"] + \"L\"");
-        assert_ne!(&lying, helix);
-        let (out, _) = run_with(&lying, wrong, None);
+        // A structure of some other protein (MKL, not the MKV that was sent).
+        let lying = MKV_PLUGIN.replace("CA VAL", "CA LEU");
+        assert_ne!(lying, MKV_PLUGIN);
+        let (out, _) = run_script(&lying, None);
         assert!(out.err().unwrap().to_string().contains("no chain matching protein A"));
+    }
+
+    /// The quick-start plugin in docs/plugins.md loads and works, so the guide stays true.
+    #[test]
+    fn the_guides_example_plugin_works() {
+        let guide = include_str!("../../docs/plugins.md");
+        let start = guide.find("   ```python\n").expect("the guide's python block") + "   ```python\n".len();
+        let len = guide[start..].find("\n   ```\n").expect("the end of that block");
+        let script: String = guide[start..start + len].lines().map(|l| format!("{}\n", l.strip_prefix("   ").unwrap_or(l))).collect();
+        let manifest = super::super::manifest::parse(&script).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(manifest.id, "ca-helix");
+        let protein = "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTT";
+        let request = serde_json::json!({
+            "api": 1,
+            "action": "build",
+            "settings": {"rise": 1.5},
+            "input": {"sequences": [{"id": "A", "seq": protein}], "feature": {"label": "GFP", "kind": "CDS"}, "doc_name": "test"},
+        });
+        let (out, msgs) = run_with(&script, request, None);
+        if msgs == ["skipped"] {
+            return;
+        }
+        let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
+        assert_eq!(out.chains, vec!["A"]);
+        assert!(out.source.as_deref().is_some_and(|s| s.contains("1.5")));
     }
 
     #[test]
@@ -501,27 +523,5 @@ edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], me
         }
         assert!(out.is_err());
         assert!(began.elapsed() < Duration::from_secs(10), "took {:?}", began.elapsed());
-    }
-
-    #[test]
-    fn the_demo_plugin_folds_a_parseable_helix() {
-        let (_, src) = crate::plugins::BUNDLED.iter().find(|(id, _)| *id == "ideal-helix").unwrap();
-        let protein = "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTT";
-        let request = serde_json::json!({
-            "api": 1,
-            "settings": {"rise": 1.5, "delay": "0"},
-            "input": {"sequences": [{"id": "A", "seq": protein}], "feature": {"label": "GFP", "kind": "CDS"}},
-        });
-        let (out, msgs) = run_with(src, request, None);
-        if msgs == ["skipped"] {
-            return;
-        }
-        let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
-        let mol = crate::structure::Molecule::parse(&out.data, crate::edna::StructureFormat::Mmcif).unwrap();
-        assert!(mol.title.to_ascii_lowercase().contains("plddt"), "{}", mol.title);
-        assert_eq!(crate::structure::protein_chains(&mol), vec![0]);
-        let (letters, _) = crate::structure::chain_letters(&mol, 0);
-        assert_eq!(String::from_utf8(letters).unwrap(), protein);
-        assert_eq!(out.plddt.len(), protein.len());
     }
 }
