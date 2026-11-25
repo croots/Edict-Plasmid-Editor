@@ -44,6 +44,34 @@ impl Target {
         Ok(aa)
     }
 
+    /// Where the feature is now: edits may have moved it in the list.
+    fn find(&self, doc: &crate::model::Document) -> Option<usize> {
+        let f = &self.feature;
+        let same = |g: &Feature| g.kind == f.kind && g.segments == f.segments && g.strand == f.strand;
+        if doc.features.get(self.feature_ix).is_some_and(same) {
+            Some(self.feature_ix)
+        } else {
+            doc.features.iter().position(same)
+        }
+    }
+
+    /// The bases to lock while the plugin runs, as `(start, end)`, wrapping through the
+    /// origin when `start > end`: the feature's span, leaving out the widest gap between
+    /// its segments (on a circular sequence, possibly the one across the origin).
+    fn lock_span(&self, len: usize, circular: bool) -> Option<(usize, usize)> {
+        let mut segs = self.feature.segments.clone();
+        segs.sort_unstable();
+        let (first, last) = (*segs.first()?, *segs.iter().max_by_key(|s| s.1)?);
+        let mut best = (if circular { len - last.1 + first.0 } else { usize::MAX }, (first.0, last.1));
+        for w in segs.windows(2) {
+            let gap = w[1].0.saturating_sub(w[0].1);
+            if circular && gap > best.0 {
+                best = (gap, (w[1].0, w[0].1));
+            }
+        }
+        Some(best.1)
+    }
+
     fn name(&self) -> String {
         if self.feature.label.trim().is_empty() { self.feature.kind.clone() } else { self.feature.label.clone() }
     }
@@ -121,6 +149,26 @@ impl PluginView {
             return;
         }
         self.error = None;
+        // The feature, as it is now: it is locked from here until the result is
+        // dismissed, so the structure still matches it when attached.
+        let span = self.editor.upgrade().map(|ed| {
+            let doc = &ed.read(cx).doc;
+            match self.target.find(doc).map(|ix| Target::protein(&doc.seq, &doc.features[ix])) {
+                Some(Ok(p)) if p == self.target.protein => self.target.lock_span(doc.len(), doc.circular).ok_or(()),
+                _ => Err(()),
+            }
+        });
+        let span = match span {
+            Some(Ok(span)) => span,
+            None => {
+                self.error = Some("The sequence's tab has closed".into());
+                return cx.notify();
+            }
+            Some(Err(())) => {
+                self.error = Some(format!("{} has changed since this dialog opened. Close it and run the plugin again.", self.target.name()));
+                return cx.notify();
+            }
+        };
         let argv = match &self.env {
             Ok((_, argv)) => argv.clone(),
             Err(why) => {
@@ -179,7 +227,7 @@ impl PluginView {
         let kind = self.plugin.manifest.name.clone();
         let r = tasks::manager(cx).update(cx, |m, cx| {
             m.set_title(id, kind, title, cx);
-            m.submit(id, Box::new(runner), None, cx)
+            m.submit(id, Box::new(runner), Some(span), cx)
         });
         self.error = r.err().map(|e| format!("{e:#}"));
         cx.notify();
@@ -195,13 +243,7 @@ impl PluginView {
         // Find the feature again: edits may have moved it in the list.
         let found = {
             let doc = &editor.read(cx).doc;
-            let same = |f: &Feature| f.kind == self.target.feature.kind && f.segments == self.target.feature.segments && f.strand == self.target.feature.strand;
-            let ix = if doc.features.get(self.target.feature_ix).is_some_and(same) {
-                Some(self.target.feature_ix)
-            } else {
-                doc.features.iter().position(same)
-            };
-            ix.map(|ix| (ix, Target::protein(&doc.seq, &doc.features[ix])))
+            self.target.find(doc).map(|ix| (ix, Target::protein(&doc.seq, &doc.features[ix])))
         };
         let ix = match found {
             None => {
@@ -519,5 +561,28 @@ impl Render for PluginView {
                     .children(self.error.clone().map(|e| div().pt_2().text_sm().text_color(theme::error()).child(e))),
             )
             .child(div().px_4().py_3().border_t_1().border_color(theme::border()).child(footer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Target;
+    use crate::model::Feature;
+
+    fn span(segments: Vec<(usize, usize)>, len: usize, circular: bool) -> Option<(usize, usize)> {
+        let feature = Feature { kind: "CDS".into(), label: String::new(), segments, strand: 1, source: None };
+        Target { feature_ix: 0, feature, protein: String::new(), doc_name: String::new() }.lock_span(len, circular)
+    }
+
+    #[test]
+    fn the_lock_covers_the_feature() {
+        assert_eq!(span(vec![(100, 400)], 1000, true), Some((100, 400)));
+        // Across the origin, in either order: a wrapping lock, not the whole plasmid.
+        assert_eq!(span(vec![(900, 1000), (0, 50)], 1000, true), Some((900, 50)));
+        assert_eq!(span(vec![(0, 50), (900, 1000)], 1000, true), Some((900, 50)));
+        // A join keeps its intron locked too: those bases are inside the feature.
+        assert_eq!(span(vec![(100, 200), (300, 400)], 1000, true), Some((100, 400)));
+        // On a linear sequence nothing wraps.
+        assert_eq!(span(vec![(0, 50), (900, 1000)], 1000, false), Some((0, 1000)));
     }
 }

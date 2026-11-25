@@ -68,7 +68,9 @@ manifest are an error, so typos show up in Settings rather than being ignored.
 
 Today the only action the app offers is `on = "feature"`, `input = "protein"`,
 `output = "structure"`. The protein is the feature translated without its stop codon. A
-feature with a stop codon inside it is refused before the plugin runs.
+feature with a stop codon inside it is refused before the plugin runs. As with BLAST,
+the feature's bases are locked from Run until the result is dismissed (or the run fails
+or is cancelled), so the structure still matches the feature when it is attached.
 
 ## Environments
 
