@@ -254,7 +254,7 @@ impl TerminalView {
             Err(_) => cmd.env("TERM", "xterm-256color"),
         }
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "plasmid-gpui");
+        cmd.env("TERM_PROGRAM", "edict");
     }
 
     fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {

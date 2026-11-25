@@ -5,7 +5,7 @@
 # # conda environment with ROCm torch instead.
 # dependencies = ["esm==3.5.0"]
 #
-# [tool.plasmid]
+# [tool.edict]
 # id = "esmfold2"
 # name = "ESMFold2"
 # api = 1
@@ -18,22 +18,22 @@
 #
 # # Tried in order; the first that works here is used (choose one in Settings → Plugins).
 # # The app's own flake: ROCm torch + esm, built by nix (prebuilt torch from the cache).
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "nix"
 # installable = "{flake}#esmfold2-env"
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "conda"
 # name = "esm"
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "venv"
 # path = ".venv"
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "uv"
 #
-# [[tool.plasmid.action]]
+# [[tool.edict.action]]
 # id = "predict"
 # label = "Predict structure with ESMFold2…"
 # on = "feature"
@@ -41,7 +41,7 @@
 # input = "protein"
 # output = "structure"
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "model"
 # label = "Model"
 # type = "choice"
@@ -51,7 +51,7 @@
 #   { value = "biohub/ESMFold2", label = "Full", help = "20 recycles, 100 steps: slower, a little more accurate." },
 # ]
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "seed"
 # label = "Seed"
 # type = "int"
@@ -59,7 +59,7 @@
 # default = 0
 # help = "Diffusion sampling is random; another seed gives another sample."
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "device"
 # label = "Device"
 # type = "choice"
@@ -70,7 +70,7 @@
 #   { value = "cpu", label = "CPU", help = "Works anywhere, but very slow, and needs ~40 GB of RAM." },
 # ]
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "chunk"
 # label = "Chunk size"
 # type = "choice"
@@ -83,7 +83,7 @@
 # ]
 # help = "Smaller chunks fold longer proteins in less GPU memory, more slowly."
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "ram_floor"
 # label = "Keep free RAM (GiB)"
 # type = "float"
@@ -93,7 +93,7 @@
 # group = "Memory"
 # help = "The memory guard stops the run if free RAM falls below this, before the system starts killing programs."
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "checks"
 # label = "Check memory before starting"
 # type = "bool"
@@ -101,7 +101,7 @@
 # group = "Memory"
 # help = "Refuse to start when there clearly isn't enough RAM or GPU memory. Turn off if you know better (e.g. with lots of swap)."
 # ///
-"""ESMFold2 structure prediction, as a plasmid-gpui plugin.
+"""ESMFold2 structure prediction, as an Edict plugin.
 
 The app runs ``python plugin.py run request.json`` in a scratch folder and shows this
 script's output in a terminal. Outside the app it works the same way, given a
@@ -124,9 +124,9 @@ import shutil
 import sys
 import time
 
-import plasmid
+import edict
 
-GIB = plasmid.GIB
+GIB = edict.GIB
 LOAD_RAM = 34 * GIB  # peak RSS while from_pretrained builds the model on the CPU
 WEIGHTS_VRAM = 12.5 * GIB
 DOWNLOAD = 26 * 10**9
@@ -160,7 +160,7 @@ def gib(n: float) -> str:
 
 
 def main() -> None:
-    req = plasmid.request()
+    req = edict.request()
     s = req.get("settings", {})
     repo = s.get("model", "biohub/ESMFold2-Fast")
     seed = int(s.get("seed", 0))
@@ -171,25 +171,25 @@ def main() -> None:
     ids = [c.get("id") or chr(ord("A") + i) for i, c in enumerate(chains)]
     length = sum(map(len, seqs))
     if not length:
-        plasmid.fail("no protein sequence to fold")
+        edict.fail("no protein sequence to fold")
     bad = sorted({ch for sq in seqs for ch in sq if not ch.isalpha()})
     if bad:
-        plasmid.fail(f"the sequence has characters that aren't amino acids: {''.join(bad)}")
+        edict.fail(f"the sequence has characters that aren't amino acids: {''.join(bad)}")
 
-    plasmid.first_to_be_killed()
+    edict.first_to_be_killed()
     print(f"ESMFold2: {len(seqs)} chain(s), {length} residues, model {repo}")
 
     # ---- checks that need nothing heavy imported ---------------------------------
-    plasmid.progress("Checking memory")
-    free = plasmid.mem_available()
+    edict.progress("Checking memory")
+    free = edict.mem_available()
     if free is not None:
         print(f"  RAM available: {gib(free)} (guard floor {gib(floor)})")
         if checks and free < LOAD_RAM + floor:
-            plasmid.fail(
+            edict.fail(
                 f"loading ESMFold2 needs about {gib(LOAD_RAM)} of RAM and only {gib(free)} is available "
                 f"(keeping {gib(floor)} free). Close other programs, or turn off "
                 "'Check memory before starting' if you have swap to spare.",
-                plasmid.MEMORY_GUARD_EXIT,
+                edict.MEMORY_GUARD_EXIT,
             )
     if not cached(repo):
         home = hf_home()
@@ -197,12 +197,12 @@ def main() -> None:
         disk = shutil.disk_usage(home).free
         print(f"  {repo} isn't downloaded yet; {disk / 1e9:.0f} GB free in {home}")
         if checks and disk < DOWNLOAD:
-            plasmid.fail(f"the first run downloads ~{DOWNLOAD / 1e9:.0f} GB into {home}, which has {disk / 1e9:.0f} GB free; set HF_HOME to a bigger disk")
+            edict.fail(f"the first run downloads ~{DOWNLOAD / 1e9:.0f} GB into {home}, which has {disk / 1e9:.0f} GB free; set HF_HOME to a bigger disk")
 
     # The guard runs from here to the end: importing torch and loading are the peaks.
-    guard = plasmid.RamGuard(int(floor), what="ESMFold2").start()
+    guard = edict.RamGuard(int(floor), what="ESMFold2").start()
 
-    plasmid.progress("Starting torch")
+    edict.progress("Starting torch")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     import torch
     try:
@@ -217,7 +217,7 @@ def main() -> None:
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda" and not torch.cuda.is_available():
-        plasmid.fail("torch sees no GPU here (for AMD, this needs a ROCm build of torch); choose CPU to run anyway")
+        edict.fail("torch sees no GPU here (for AMD, this needs a ROCm build of torch); choose CPU to run anyway")
     on_gpu = device == "cuda"
     rocm = on_gpu and torch.version.hip is not None
     nvidia = on_gpu and not rocm
@@ -234,10 +234,10 @@ def main() -> None:
         headroom = 1 * GIB
         budget = gpu_free - WEIGHTS_VRAM - headroom
         if checks and budget < activations(length, 16) * 0.25:
-            plasmid.fail(
+            edict.fail(
                 f"the GPU has {gib(gpu_free)} free; ESMFold2's weights alone take {gib(WEIGHTS_VRAM)}. "
                 "Close what else is using it, or choose the CPU.",
-                plasmid.MEMORY_GUARD_EXIT,
+                edict.MEMORY_GUARD_EXIT,
             )
         if chunk_setting == "auto":
             chunk = next((c for c in CHUNKS if activations(length, c) < budget), "big")
@@ -258,9 +258,9 @@ def main() -> None:
     fast = "fast" in repo.lower()
     loops, steps = (3, 50) if fast else (20, 100)
 
-    plasmid.progress("Loading the model" + ("" if cached(repo) else " (downloading ~26 GB)"))
+    edict.progress("Loading the model" + ("" if cached(repo) else " (downloading ~26 GB)"))
     print(f"Loading {repo} (esmc {precision}, kernels {kernels or 'reference'})")
-    with plasmid.Timer() as t:
+    with edict.Timer() as t:
         model = EsmFold2Model.from_pretrained(repo, device=device, esmc_precision=precision).eval()
         model.set_kernel_backend(kernels)
     print(f"  loaded in {t.seconds:.1f} s" + (f"; GPU now has {gib(torch.cuda.mem_get_info()[0])} free" if on_gpu else ""))
@@ -279,10 +279,10 @@ def main() -> None:
     retries = 2
     while True:
         set_chunk(chunk)
-        plasmid.progress(f"Folding {length} residues (chunk {chunk})")
+        edict.progress(f"Folding {length} residues (chunk {chunk})")
         print(f"Folding: {loops} recycles, {steps} diffusion steps, seed {seed}, chunk {chunk}")
         try:
-            with plasmid.Timer() as t, torch.inference_mode():
+            with edict.Timer() as t, torch.inference_mode():
                 out = ESMFold2InputBuilder().fold(
                     model, spi, num_loops=loops, num_sampling_steps=steps, num_diffusion_samples=1, seed=seed
                 )
@@ -293,12 +293,12 @@ def main() -> None:
                 torch.cuda.empty_cache()
             smaller = {64: 32, 32: 16, 16: "big"}.get(chunk) if chunk != "big" else None
             if retries == 0 or smaller is None:
-                plasmid.fail(
+                edict.fail(
                     f"ran out of GPU memory folding {length} residues even at chunk {chunk}. "
                     "Close other programs using the GPU, or fold a shorter region.",
-                    plasmid.MEMORY_GUARD_EXIT,
+                    edict.MEMORY_GUARD_EXIT,
                 )
-            plasmid.warn(f"ran out of GPU memory at chunk {chunk}; trying {smaller}")
+            edict.warn(f"ran out of GPU memory at chunk {chunk}; trying {smaller}")
             chunk, retries = smaller, retries - 1
     if isinstance(out, list):
         out = out[0]
@@ -324,7 +324,7 @@ def main() -> None:
         metrics["ipTM"] = scalar(out.iptm)
     metrics = {k: v for k, v in metrics.items() if v is not None}
     print("  " + ", ".join(f"{k} {v:.2f}" if v < 2 else f"{k} {v:.1f}" for k, v in metrics.items()))
-    plasmid.result(
+    edict.result(
         kind="structure",
         file="prediction.cif",
         format="mmcif",

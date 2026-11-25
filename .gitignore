@@ -1,1 +1,5 @@
 target/
+
+# Local Claude Code state (worktrees, personal settings)
+/.claude/worktrees/
+/.claude/settings.local.json

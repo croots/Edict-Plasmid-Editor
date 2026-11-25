@@ -175,7 +175,7 @@ pub fn assign(residues: &[(usize, Backbone)]) -> Vec<Ss> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pgx::StructureFormat;
+    use crate::edna::StructureFormat;
     use crate::structure::{Molecule, Ss};
 
     /// GFP (2Y0G) with its HELIX/SHEET records removed comes out close to the authors'

@@ -13,7 +13,7 @@ use std::ops::Range;
 use anyhow::{bail, Result};
 
 use crate::model::{self, Feature};
-use crate::pgx::{self, ChainLinking, Structure, StructureFormat};
+use crate::edna::{self, ChainLinking, Structure, StructureFormat};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ss {
@@ -889,7 +889,7 @@ impl StructureFile {
         // Four characters starting with a digit is a PDB entry; say where it came from.
         let pdb = stem.len() == 4 && stem.chars().all(|c| c.is_ascii_alphanumeric()) && stem.starts_with(|c: char| c.is_ascii_digit());
         Structure {
-            id: pgx::structure_id(stem, taken),
+            id: edna::structure_id(stem, taken),
             name: self.name.clone(),
             format: self.format,
             source: pdb.then(|| format!("PDB {}", stem.to_ascii_uppercase())),
@@ -1083,12 +1083,12 @@ mod sample_tests {
     }
 }
 
-/// `cargo test -- --ignored write_egfp_sample` rebuilds `samples/pEGFP-N1.pgx`: the
+/// `cargo test -- --ignored write_egfp_sample` rebuilds `samples/pEGFP-N1.edna`: the
 /// GenBank plasmid with the 2Y0G EGFP structure attached.
 #[cfg(test)]
 mod make_samples {
     use crate::model::{Document, Format};
-    use crate::pgx::{ChainLinking, Structure, StructureFormat};
+    use crate::edna::{ChainLinking, Structure, StructureFormat};
     use std::path::Path;
 
     #[test]
@@ -1106,8 +1106,8 @@ mod make_samples {
             data: data.into(),
         });
         let bytes = doc.serialize_as(Format::Native).unwrap();
-        std::fs::write(dir.join("pEGFP-N1.pgx"), bytes).unwrap();
-        let back = Document::open(&dir.join("pEGFP-N1.pgx")).unwrap();
+        std::fs::write(dir.join("pEGFP-N1.edna"), bytes).unwrap();
+        let back = Document::open(&dir.join("pEGFP-N1.edna")).unwrap();
         assert_eq!(back.structures.len(), 1);
     }
 }

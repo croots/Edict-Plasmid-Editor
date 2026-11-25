@@ -21,7 +21,7 @@ use crate::feature_dialog::{DialogEvent, FeatureDialog};
 use crate::layout::{self, Layout};
 use crate::map_layout;
 use crate::model::{self, Document, Feature, Format};
-use crate::pgx::{self, ChainLinking};
+use crate::edna::{self, ChainLinking};
 use crate::genetic_code;
 use crate::locks::Lock;
 use crate::tasks;
@@ -1133,7 +1133,7 @@ impl SeqEditor {
         cx.notify();
     }
 
-    /// Ctrl+S. Files in another format ask first whether to convert to `.pgx` (the only
+    /// Ctrl+S. Files in another format ask first whether to convert to `.edna` (the only
     /// format that keeps edit history) or keep their format. "Keep" lasts for the tab.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.doc.untitled {
@@ -1153,19 +1153,19 @@ impl SeqEditor {
 
     fn ask_convert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = file_name(&self.doc.path);
-        let target = file_name(&self.doc.path.with_extension(pgx::EXTENSION));
+        let target = file_name(&self.doc.path.with_extension(edna::EXTENSION));
         let convert = format!("Convert saves your changes to {target} beside it and leaves {name} untouched.");
         let (detail, answers): (String, &[&str]) = match self.doc.format {
             Format::SnapGene => (
                 format!("{name} is a SnapGene file. SnapGene files can be opened but not written. {convert}"),
-                &["Convert to .pgx", "Cancel"],
+                &["Convert to .edna", "Cancel"],
             ),
             Format::Fasta => (
                 format!(
                     "FASTA holds only the bases. {convert}\n\nKeep overwrites {name} with the sequence alone: its topology{} and edit history are not saved.",
                     if self.doc.features.is_empty() { "" } else { ", features" }
                 ),
-                &["Convert to .pgx", "Keep FASTA", "Cancel"],
+                &["Convert to .edna", "Keep FASTA", "Cancel"],
             ),
             _ => (
                 if self.doc.structures.is_empty() {
@@ -1177,11 +1177,11 @@ impl SeqEditor {
                         "GenBank keeps the sequence, features and annotations, but not edit history or attached structures. {convert}\n\nKeep overwrites {name}; this session's edit history and the attached structures are not saved."
                     )
                 },
-                &["Convert to .pgx", "Keep GenBank", "Cancel"],
+                &["Convert to .edna", "Keep GenBank", "Cancel"],
             ),
         };
         let can_keep = answers.len() == 3;
-        let answer = window.prompt(PromptLevel::Warning, &format!("Save {name} as a .{} file?", pgx::EXTENSION), Some(&detail), answers, cx);
+        let answer = window.prompt(PromptLevel::Warning, &format!("Save {name} as a .{} file?", edna::EXTENSION), Some(&detail), answers, cx);
         cx.spawn(async move |this, cx| {
             let answer = answer.await;
             this.update(cx, |ed, cx| {
@@ -1200,10 +1200,10 @@ impl SeqEditor {
         .detach();
     }
 
-    /// Switch to `name.pgx` beside the current file. If that name is taken, let the
+    /// Switch to `name.edna` beside the current file. If that name is taken, let the
     /// save dialog pick (it asks before overwriting).
     fn convert(&mut self, cx: &mut Context<Self>) {
-        let target = self.doc.path.with_extension(pgx::EXTENSION);
+        let target = self.doc.path.with_extension(edna::EXTENSION);
         if target.exists() {
             self.save_as_suggesting(Some(file_name(&target)), cx);
             return;
@@ -1257,12 +1257,12 @@ impl SeqEditor {
     }
 
     /// Ask where to save, then switch the document to that file and save it there.
-    /// The extension picks the format; with none, it becomes a `.pgx`.
+    /// The extension picks the format; with none, it becomes a `.edna`.
     pub fn save_as(&mut self, cx: &mut Context<Self>) {
         let suggested = if self.doc.format.writable() {
             file_name(&self.doc.path)
         } else {
-            file_name(&self.doc.path.with_extension(pgx::EXTENSION))
+            file_name(&self.doc.path.with_extension(edna::EXTENSION))
         };
         self.save_as_suggesting(Some(suggested), cx);
     }
@@ -1539,7 +1539,7 @@ impl Render for SeqEditor {
 }
 
 pub(crate) fn editor_font() -> Font {
-    let family = std::env::var("PLASMID_FONT").unwrap_or_else(|_| {
+    let family = std::env::var("EDICT_FONT").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") { "Menlo".into() } else { "DejaVu Sans Mono".into() }
     });
     gpui::font(family)
@@ -2045,13 +2045,13 @@ fn file_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// A name typed without a recognised extension saves as `.pgx`.
+/// A name typed without a recognised extension saves as `.edna`.
 fn with_default_extension(path: PathBuf) -> PathBuf {
     if Format::from_path(&path).is_some() {
         path
     } else {
         let mut s = path.into_os_string();
-        s.push(format!(".{}", pgx::EXTENSION));
+        s.push(format!(".{}", edna::EXTENSION));
         PathBuf::from(s)
     }
 }

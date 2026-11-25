@@ -1,5 +1,5 @@
 //! User settings, stored as plain `key = value` lines in
-//! `$XDG_CONFIG_HOME/plasmid-gpui/settings.conf` (`~/.config/...` by default).
+//! `$XDG_CONFIG_HOME/edict/settings.conf` (`~/.config/...` by default).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -40,7 +40,7 @@ pub fn config_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("plasmid-gpui").join("settings.conf"))
+    Some(base.join("edict").join("settings.conf"))
 }
 
 impl Settings {
@@ -80,7 +80,7 @@ impl Settings {
     }
 
     fn serialize(&self) -> String {
-        let mut out = String::from("# plasmid-gpui settings\n");
+        let mut out = String::from("# edict settings\n");
         out.push_str(&format!("theme = {}\n", self.theme));
         for p in &self.custom_theme_paths {
             out.push_str(&format!("custom_theme = {}\n", p.display()));

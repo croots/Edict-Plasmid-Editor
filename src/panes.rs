@@ -23,7 +23,7 @@ use crate::structure_view::StructureView;
 use crate::terminal::TerminalView;
 use crate::theme;
 
-actions!(plasmid, [SplitRight, SplitDown, ClosePane]);
+actions!(edict, [SplitRight, SplitDown, ClosePane]);
 
 const DIVIDER: f32 = 5.0;
 const MIN_PANE: f32 = 120.0;
@@ -332,7 +332,7 @@ impl PaneGroup {
         };
         let doc = &self.editor.read(cx).doc;
         let structures: Vec<(String, String)> = doc.structures.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
-        // Only `.pgx` keeps the edit log, so only offer it there.
+        // Only `.edna` keeps the edit log, so only offer it there.
         let has_history = doc.format == Format::Native;
         let mut list = div()
             .id("split-menu")

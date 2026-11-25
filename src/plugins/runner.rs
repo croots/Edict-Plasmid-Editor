@@ -15,13 +15,13 @@ use serde::Deserialize;
 use crate::tasks::{Output, TaskCtx, TaskRunner};
 use crate::terminal::{pump_reader, PtyHandoff, TerminalView};
 
-/// The helper module every plugin can `import plasmid`.
-pub const HELPER: &str = include_str!("../../plugins/plasmid.py");
+/// The helper module every plugin can `import edict`.
+pub const HELPER: &str = include_str!("../../plugins/edict.py");
 
-/// The exit status plasmid.py's memory guard stops with.
+/// The exit status edict.py's memory guard stops with.
 pub const MEMORY_GUARD_EXIT: u32 = 75;
 
-/// A run's scratch folder under `~/.cache/plasmid-gpui/tasks/`; removed once nothing
+/// A run's scratch folder under `~/.cache/edict/tasks/`; removed once nothing
 /// (the worker, the result) needs it.
 pub struct Scratch(pub PathBuf);
 
@@ -36,7 +36,7 @@ pub fn cache_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("plasmid-gpui"))
+    Some(base.join("edict"))
 }
 
 impl Scratch {
@@ -44,7 +44,7 @@ impl Scratch {
         let base = cache_dir().context("no HOME or XDG_CACHE_HOME for a scratch folder")?.join("tasks");
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let dir = base.join(format!("{plugin}-{}-{task}-{stamp}", std::process::id()));
-        std::fs::create_dir_all(dir.join(".plasmid")).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(".edict")).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Arc::new(Scratch(dir)))
     }
 
@@ -180,11 +180,11 @@ impl TaskRunner for PluginRunner {
 
     fn run(self: Box<Self>, ctx: &TaskCtx) -> Result<Output> {
         let dir = self.workdir.path().to_path_buf();
-        let meta = dir.join(".plasmid");
+        let meta = dir.join(".edict");
         let request_path = meta.join("request.json");
         let events_path = meta.join("events.jsonl");
         std::fs::write(&request_path, serde_json::to_vec_pretty(&self.request)?)?;
-        std::fs::write(meta.join("plasmid.py"), HELPER)?;
+        std::fs::write(meta.join("edict.py"), HELPER)?;
         std::fs::write(&events_path, b"")?;
 
         let (cols, rows) = self.grid;
@@ -208,10 +208,10 @@ impl TaskRunner for PluginRunner {
         };
         cmd.env("PYTHONPATH", pythonpath);
         cmd.env("PYTHONUNBUFFERED", "1");
-        cmd.env("PLASMID_EVENTS", &events_path);
-        cmd.env("PLASMID_REQUEST", &request_path);
-        cmd.env("PLASMID_WORKDIR", &dir);
-        cmd.env("PLASMID_API", super::manifest::API.to_string());
+        cmd.env("EDICT_EVENTS", &events_path);
+        cmd.env("EDICT_REQUEST", &request_path);
+        cmd.env("EDICT_WORKDIR", &dir);
+        cmd.env("EDICT_API", super::manifest::API.to_string());
 
         ctx.log(format!("Running {}", shell_words(&self.env_argv, &self.script)));
         let mut child = pair.slave.spawn_command(cmd).context("couldn't start the plugin")?;
@@ -333,7 +333,7 @@ impl PluginRunner {
     /// chains, residue for residue; otherwise it can't be linked to the feature.
     fn check_structure(&self, data: &[u8], format: &str) -> Result<()> {
         use crate::structure::{chain_letters, Molecule};
-        let fmt = if format == "pdb" { crate::pgx::StructureFormat::Pdb } else { crate::pgx::StructureFormat::Mmcif };
+        let fmt = if format == "pdb" { crate::edna::StructureFormat::Pdb } else { crate::edna::StructureFormat::Mmcif };
         let mol = Molecule::parse(data, fmt).context("the plugin's structure doesn't parse")?;
         let chains: Vec<Vec<u8>> = (0..mol.chains.len()).map(|ci| chain_letters(&mol, ci).0.to_ascii_uppercase()).collect();
         let sent = self.request["input"]["sequences"].as_array().cloned().unwrap_or_default();
@@ -373,8 +373,8 @@ mod tests {
     }
 
     fn run_with(script: &str, request: serde_json::Value, cancel_after: Option<Duration>) -> (Result<Output>, Vec<String>) {
-        let tmp = std::env::temp_dir().join(format!("plasmid-plugin-test-{}-{}", std::process::id(), rand_suffix()));
-        std::fs::create_dir_all(tmp.join(".plasmid")).unwrap();
+        let tmp = std::env::temp_dir().join(format!("edict-plugin-test-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(tmp.join(".edict")).unwrap();
         let path = tmp.join("plugin.py");
         std::fs::write(&path, script).unwrap();
         let Some(py) = super::super::env::which("python3").or_else(|| super::super::env::which("python")) else {
@@ -420,7 +420,7 @@ mod tests {
     fn a_plugin_gives_a_structure() {
         let (out, msgs) = run_script(
             r#"
-import plasmid, sys
+import edict, sys
 CIF = """data_mkv
 loop_
 _atom_site.group_PDB
@@ -443,12 +443,12 @@ ATOM 1 C CA MET A 1 1 0.0 0.0 0.0 1.00 90 1 A 1
 ATOM 2 C CA LYS A 1 2 3.8 0.0 0.0 1.00 80 2 A 1
 ATOM 3 C CA VAL A 1 3 7.6 0.0 0.0 1.00 70 3 A 1
 """
-req = plasmid.request()
+req = edict.request()
 assert req["input"]["sequences"][0]["seq"] == "MKV"
 print("hello from the plugin")
-plasmid.progress("Folding", 0.5)
+edict.progress("Folding", 0.5)
 open("pred.cif", "w").write(CIF)
-plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], metrics={"ptm": 0.8}, plddt=[90, 80, 70])
+edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], metrics={"ptm": 0.8}, plddt=[90, 80, 70])
 "#,
             None,
         );
@@ -468,16 +468,16 @@ plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], 
 
     #[test]
     fn failures_say_why() {
-        let (out, msgs) = run_script("import plasmid\nplasmid.fail('no GPU here')\n", None);
+        let (out, msgs) = run_script("import edict\nedict.fail('no GPU here')\n", None);
         if msgs == ["skipped"] {
             return;
         }
         assert_eq!(out.err().unwrap().to_string(), "no GPU here");
         let (out, _) = run_script("import sys\nsys.exit(3)\n", None);
         assert!(out.err().unwrap().to_string().contains("status 3"));
-        let (out, _) = run_script("import plasmid\nplasmid.fail('memory guard: low', plasmid.MEMORY_GUARD_EXIT)\n", None);
+        let (out, _) = run_script("import edict\nedict.fail('memory guard: low', edict.MEMORY_GUARD_EXIT)\n", None);
         assert!(out.err().unwrap().to_string().contains("memory guard"));
-        let (out, _) = run_script("import plasmid\nplasmid.result(kind='structure', file='../../etc/passwd')\n", None);
+        let (out, _) = run_script("import edict\nedict.result(kind='structure', file='../../etc/passwd')\n", None);
         assert!(out.err().unwrap().to_string().contains("isn't in the run's folder"));
         let (out, _) = run_script("pass\n", None);
         assert!(out.err().unwrap().to_string().contains("without giving a result"));
@@ -517,7 +517,7 @@ plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], 
             return;
         }
         let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
-        let mol = crate::structure::Molecule::parse(&out.data, crate::pgx::StructureFormat::Mmcif).unwrap();
+        let mol = crate::structure::Molecule::parse(&out.data, crate::edna::StructureFormat::Mmcif).unwrap();
         assert!(mol.title.to_ascii_lowercase().contains("plddt"), "{}", mol.title);
         assert_eq!(crate::structure::protein_chains(&mol), vec![0]);
         let (letters, _) = crate::structure::chain_letters(&mol, 0);

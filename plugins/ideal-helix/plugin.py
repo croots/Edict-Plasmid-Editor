@@ -3,7 +3,7 @@
 # requires-python = ">=3.9"
 # dependencies = []
 #
-# [tool.plasmid]
+# [tool.edict]
 # id = "ideal-helix"
 # name = "Ideal helix (demo)"
 # api = 1
@@ -14,15 +14,15 @@
 # anything. The confidence it reports is made up, to show the colouring."""
 #
 # # No dependencies, so any Python 3 will do.
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "python"
 # path = "python3"
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "python"
 # path = "python"
 #
-# [[tool.plasmid.action]]
+# [[tool.edict.action]]
 # id = "helix"
 # label = "Build ideal helix (demo)"
 # on = "feature"
@@ -30,7 +30,7 @@
 # input = "protein"
 # output = "structure"
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "rise"
 # label = "Rise per residue (Å)"
 # type = "float"
@@ -39,7 +39,7 @@
 # default = 1.5
 # help = "1.5 Å for an alpha helix; 2.0 for a 3-10 helix."
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "delay"
 # label = "Pretend to work for"
 # type = "choice"
@@ -47,9 +47,9 @@
 # default = "3"
 # help = "Time to try out Background and Cancel."
 # ///
-"""Build a protein as an ideal helix: the smallest complete plasmid-gpui plugin.
+"""Build a protein as an ideal helix: the smallest complete Edict plugin.
 
-Run by the app as ``python plugin.py run request.json``; ``plasmid`` is the helper
+Run by the app as ``python plugin.py run request.json``; ``edict`` is the helper
 module the app puts on PYTHONPATH.
 """
 
@@ -57,7 +57,7 @@ import math
 import sys
 import time
 
-import plasmid
+import edict
 
 THREE = {
     "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN", "E": "GLU",
@@ -118,7 +118,7 @@ def helix_cif(seq: str, rise: float, confidence: list) -> str:
 
 
 def main() -> None:
-    req = plasmid.request()
+    req = edict.request()
     settings = req["settings"]
     chain = req["input"]["sequences"][0]
     seq = chain["seq"]
@@ -127,7 +127,7 @@ def main() -> None:
     delay = float(settings["delay"])
     steps = 20
     for k in range(steps):
-        plasmid.progress("Pretending to fold", k / steps)
+        edict.progress("Pretending to fold", k / steps)
         print(f"  step {k + 1}/{steps}", flush=True)
         time.sleep(delay / steps)
 
@@ -136,7 +136,7 @@ def main() -> None:
     with open("helix.cif", "w", encoding="ascii") as fh:
         fh.write(helix_cif(seq, float(settings["rise"]), conf))
     print("Wrote helix.cif")
-    plasmid.result(
+    edict.result(
         kind="structure",
         file="helix.cif",
         format="mmcif",

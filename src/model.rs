@@ -11,7 +11,7 @@ use gb_io::seq::{Feature as GbFeature, Location, Seq, Topology};
 use serde::{Deserialize, Serialize};
 
 use crate::locks::{self, Lock};
-use crate::pgx::{self, SavePoint, Structure};
+use crate::edna::{self, SavePoint, Structure};
 use crate::genetic_code;
 use crate::snapgene;
 
@@ -33,7 +33,7 @@ impl Feature {
     /// qualifiers: (structure id, chain id).
     pub fn structure_refs(&self) -> Vec<(String, String)> {
         let Some(src) = &self.source else { return Vec::new() };
-        src.qualifier_values(pgx::STRUCTURE_QUALIFIER)
+        src.qualifier_values(edna::STRUCTURE_QUALIFIER)
             .filter_map(|v| v.trim().split_once(':'))
             .map(|(s, c)| (s.to_string(), c.to_string()))
             .collect()
@@ -60,17 +60,17 @@ impl Feature {
         }
         let Some(src) = self.gb_source() else { return };
         src.qualifiers.retain(|(k, v)| {
-            k != pgx::STRUCTURE_QUALIFIER || v.as_deref().and_then(|v| v.trim().split_once(':')).is_none_or(|(s, _)| s != id)
+            k != edna::STRUCTURE_QUALIFIER || v.as_deref().and_then(|v| v.trim().split_once(':')).is_none_or(|(s, _)| s != id)
         });
         for c in chains {
-            src.qualifiers.push((pgx::STRUCTURE_QUALIFIER.into(), Some(format!("{id}:{c}"))));
+            src.qualifiers.push((edna::STRUCTURE_QUALIFIER.into(), Some(format!("{id}:{c}"))));
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
-    /// Our zip container (`.pgx`), the only format that keeps edit history.
+    /// Our zip container (`.edna`), the only format that keeps edit history.
     Native,
     GenBank,
     Fasta,
@@ -81,7 +81,7 @@ pub enum Format {
 impl Format {
     pub fn from_path(path: &Path) -> Option<Format> {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-            pgx::EXTENSION => Some(Format::Native),
+            edna::EXTENSION => Some(Format::Native),
             "fa" | "fasta" | "fna" | "fas" => Some(Format::Fasta),
             "gb" | "gbk" | "genbank" | "gbff" | "ape" => Some(Format::GenBank),
             "dna" => Some(Format::SnapGene),
@@ -95,7 +95,7 @@ impl Format {
 
     pub fn name(self) -> &'static str {
         match self {
-            Format::Native => "Plasmid (.pgx)",
+            Format::Native => "Edict (.edna)",
             Format::GenBank => "GenBank",
             Format::Fasta => "FASTA",
             Format::SnapGene => "SnapGene",
@@ -170,13 +170,13 @@ pub enum Op {
     AttachStructure {
         id: String,
         name: String,
-        format: pgx::StructureFormat,
+        format: edna::StructureFormat,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
         bytes: usize,
     },
     RemoveStructure { id: String, name: String },
-    LinkStructure { id: String, name: String, before: pgx::ChainLinking, after: pgx::ChainLinking },
+    LinkStructure { id: String, name: String, before: edna::ChainLinking, after: edna::ChainLinking },
     /// The record took a new name (Save As).
     Rename { before: String, after: String },
     /// Logged just before a step's base edits: the features, as they were before it,
@@ -275,15 +275,15 @@ pub struct Document {
     pub untitled: bool,
     /// Persistent revision counter: one per edit (undo and redo count), across sessions.
     pub revision: u64,
-    /// Every edit, oldest first, including ones loaded from a `.pgx`.
+    /// Every edit, oldest first, including ones loaded from a `.edna`.
     pub history: Vec<Edit>,
     pub saves: Vec<SavePoint>,
-    /// Attached 3D structures. Only `.pgx` keeps them.
+    /// Attached 3D structures. Only `.edna` keeps them.
     pub structures: Vec<Structure>,
     /// Problems found while loading that didn't stop the file opening.
     pub warnings: Vec<String>,
     record: Option<Seq>,
-    /// `.pgx` entries this build doesn't understand, written back unchanged.
+    /// `.edna` entries this build doesn't understand, written back unchanged.
     extras: Vec<(String, Vec<u8>)>,
     /// Each undo step restores one snapshot; it may cover several logged ops.
     undo: Vec<(Snapshot, Vec<Op>)>,
@@ -294,7 +294,7 @@ pub struct Document {
 }
 
 const SEQ_EXTENSIONS: &[&str] =
-    &[pgx::EXTENSION, "gb", "gbk", "genbank", "gbff", "ape", "fa", "fasta", "fna", "fas", "dna"];
+    &[edna::EXTENSION, "gb", "gbk", "genbank", "gbff", "ape", "fa", "fasta", "fna", "fas", "dna"];
 
 pub fn is_sequence_file(path: &Path) -> bool {
     path.extension()
@@ -311,8 +311,8 @@ impl Document {
     /// Open by content first (zip, SnapGene header, `>`), falling back to the extension.
     pub fn open(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if pgx::looks_like_zip(&bytes) {
-            let b = pgx::read(&bytes).context("reading plasmid file")?;
+        if edna::looks_like_zip(&bytes) {
+            let b = edna::read(&bytes).context("reading .edna file")?;
             let mut doc = Self::from_record(path, b.record, Format::Native);
             doc.revision = b.revision;
             doc.history = b.history;
@@ -363,7 +363,7 @@ impl Document {
         }
     }
 
-    /// A `.pgx` keeps its bases' case exactly (its log depends on it); other formats
+    /// A `.edna` keeps its bases' case exactly (its log depends on it); other formats
     /// go through [`conventional_case`].
     fn from_record(path: &Path, mut record: Seq, format: Format) -> Self {
         if format != Format::Native {
@@ -431,7 +431,7 @@ impl Document {
     pub fn set_path(&mut self, path: &Path) -> Result<()> {
         let format = Format::from_path(path).unwrap_or(self.format);
         if !format.writable() {
-            bail!("{} files can't be written; pick .{}, .gb or .fa", format.name(), pgx::EXTENSION);
+            bail!("{} files can't be written; pick .{}, .gb or .fa", format.name(), edna::EXTENSION);
         }
         self.format = format;
         self.path = path.to_path_buf();
@@ -721,7 +721,7 @@ impl Document {
     }
 
     /// Change how structure `id` links its chains. Not an undo step.
-    pub fn set_structure_linking(&mut self, id: &str, linking: pgx::ChainLinking) {
+    pub fn set_structure_linking(&mut self, id: &str, linking: edna::ChainLinking) {
         let Some(s) = self.structures.iter_mut().find(|s| s.id == id && s.linking != linking) else { return };
         let op = Op::LinkStructure { id: s.id.clone(), name: s.name.clone(), before: s.linking, after: linking };
         s.linking = linking;
@@ -982,7 +982,7 @@ impl Document {
                 if saves.last().map(|s| s.rev) != Some(self.revision) {
                     saves.push(SavePoint { rev: self.revision, time: now(), author: author(), label: None });
                 }
-                out = pgx::write(pgx::BundleRef {
+                out = edna::write(edna::BundleRef {
                     record: &self.genbank_record(),
                     revision: self.revision,
                     history: &self.history,
@@ -1284,7 +1284,7 @@ mod tests {
         assert_eq!(sanitize_bases("ac gT-x\nN"), b"acgTN");
         assert_eq!(gc_percent(b"gcAT"), 50.0);
 
-        let dir = std::env::temp_dir().join("plasmid-gpui-case");
+        let dir = std::env::temp_dir().join("edict-case");
         std::fs::create_dir_all(&dir).unwrap();
         // Mixed case survives FASTA; an all-lower-case file is just convention.
         let mixed = dir.join("mixed.fa");
@@ -1294,8 +1294,8 @@ mod tests {
         std::fs::write(&lower, ">l\nacgt\n").unwrap();
         assert_eq!(&Document::open(&lower).unwrap().seq[..], b"ACGT");
 
-        // A .pgx keeps exactly what was typed, even all lower case, and its log.
-        let path = dir.join("typed.pgx");
+        // A .edna keeps exactly what was typed, even all lower case, and its log.
+        let path = dir.join("typed.edna");
         let mut d = Document::new_untitled(&path);
         d.set_path(&path).unwrap();
         d.insert(0, b"acgt");
@@ -1308,9 +1308,9 @@ mod tests {
     #[test]
     fn every_saved_change_is_logged_and_survives_a_round_trip() {
         set_author(Some("ada".into()));
-        let dir = std::env::temp_dir().join("plasmid-gpui-log");
+        let dir = std::env::temp_dir().join("edict-log");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("log.pgx");
+        let path = dir.join("log.edna");
         let mut d = Document::new_untitled(&path);
         d.set_path(&path).unwrap();
         d.insert(0, b"ACGTACGTACGT");
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(back.features[0].label, "renamed");
 
         // Save As under a new name logs the rename.
-        d.set_path(&dir.join("log2.pgx")).unwrap();
+        d.set_path(&dir.join("log2.edna")).unwrap();
         assert_eq!(d.history.last().unwrap().op, Op::Rename { before: "log".into(), after: "log2".into() });
     }
 
@@ -1404,9 +1404,9 @@ mod tests {
         }
 
         // The log as saved reads back the same way.
-        let dir = std::env::temp_dir().join("plasmid-gpui-revert");
+        let dir = std::env::temp_dir().join("edict-revert");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("revert.pgx");
+        let path = dir.join("revert.edna");
         d.set_path(&path).unwrap();
         d.save().unwrap();
         let back = Document::open(&path).unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
     #[test]
     fn genbank_save_round_trips() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/pBR322.gb");
-        let tmp = std::env::temp_dir().join("plasmid-gpui-roundtrip.gb");
+        let tmp = std::env::temp_dir().join("edict-roundtrip.gb");
         std::fs::copy(&src, &tmp).unwrap();
         let mut d = Document::open(&tmp).unwrap();
         d.insert(10, b"GGG");
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn untitled_save_as_writes_requested_format() {
-        let dir = std::env::temp_dir().join("plasmid-gpui-untitled");
+        let dir = std::env::temp_dir().join("edict-untitled");
         std::fs::create_dir_all(&dir).unwrap();
         let mut d = Document::new_untitled(&dir.join("untitled-1.gb"));
         assert!(d.untitled);
@@ -1552,7 +1552,7 @@ mod tests {
 
     #[test]
     fn untitled_defaults_to_native() {
-        let d = Document::new_untitled(Path::new("/tmp/untitled-1.pgx"));
+        let d = Document::new_untitled(Path::new("/tmp/untitled-1.edna"));
         assert_eq!(d.format, Format::Native);
         let mut d = Document::new_untitled(Path::new("/tmp/untitled-1.gb"));
         assert_eq!(d.format, Format::GenBank);
@@ -1592,12 +1592,12 @@ mod tests {
 
     #[test]
     fn genbank_converts_to_native_and_keeps_history_across_saves() {
-        let dir = std::env::temp_dir().join("plasmid-gpui-native");
+        let dir = std::env::temp_dir().join("edict-native");
         std::fs::create_dir_all(&dir).unwrap();
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/pBR322.gb");
         let mut d = Document::open(&src).unwrap();
         d.insert(10, b"GGG");
-        let target = dir.join("pBR322.pgx");
+        let target = dir.join("pBR322.edna");
         d.set_path(&target).unwrap();
         assert_eq!(d.format, Format::Native);
         d.save().unwrap();
@@ -1628,7 +1628,7 @@ mod tests {
         let d = Document::open(&src).unwrap();
         let fasta = d.serialize_as(Format::Fasta).unwrap();
         assert!(fasta.starts_with(b">pUC19\n"));
-        assert!(pgx::looks_like_zip(&d.serialize_as(Format::Native).unwrap()));
+        assert!(edna::looks_like_zip(&d.serialize_as(Format::Native).unwrap()));
         assert!(d.serialize_as(Format::SnapGene).is_err());
         assert_eq!(d.format, Format::GenBank);
         assert_eq!(d.path, src);

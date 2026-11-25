@@ -16,7 +16,7 @@ use gpui::{
 
 use crate::editor::{thousands, SeqEditor};
 use crate::model::{self, Feature};
-use crate::pgx::ChainLinking;
+use crate::edna::ChainLinking;
 use crate::structure::{self, Molecule, Proposal, StructureFile};
 use crate::theme;
 use crate::workspace::Dismiss;
@@ -503,7 +503,7 @@ impl Render for AttachDialog {
 mod tests {
     use super::*;
     use crate::model::Document;
-    use crate::pgx::StructureFormat;
+    use crate::edna::StructureFormat;
 
     fn sample() -> (Document, Molecule) {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/");

@@ -1,5 +1,5 @@
 {
-  description = "plasmid-gpui - proof-of-concept plasmid sequence editor built on GPUI";
+  description = "Edict - a DNA sequence editor built on GPUI";
 
   # Enter with `nix develop`, then `cargo run --release -- <folder with .gb files>`.
 

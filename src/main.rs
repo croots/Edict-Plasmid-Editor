@@ -16,7 +16,7 @@ mod map_layout;
 mod model;
 mod notify;
 mod panes;
-mod pgx;
+mod edna;
 mod plugins;
 mod sbol;
 mod settings;
@@ -38,7 +38,7 @@ use gpui::{px, size, App, AppContext, Application, Bounds, TitlebarOptions, Wind
 use workspace::Workspace;
 
 fn main() {
-    // Usage: plasmid-gpui [folder] [file-to-open]
+    // Usage: edict [folder] [file-to-open]
     let mut args = std::env::args().skip(1);
     let root = args
         .next()
@@ -55,8 +55,8 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Plasmid Editor (GPUI PoC)".into()), ..Default::default() }),
-                app_id: Some("plasmid-gpui".into()),
+                titlebar: Some(TitlebarOptions { title: Some("Edict".into()), ..Default::default() }),
+                app_id: Some("edict".into()),
                 ..Default::default()
             },
             |window, cx| {

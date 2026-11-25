@@ -1,6 +1,6 @@
 """Fold protein sequence(s) with ESMFold2 and write an mmCIF file.
 
-Built for being driven by another program (the planned plasmid-gpui plugin):
+Built for being driven by another program (the Edict plugin):
 progress goes to stderr, and stdout carries exactly one JSON object:
 
     {"out": "pred.cif", "model": "...", "device": "cuda", "ptm": 0.81,

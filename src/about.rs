@@ -274,12 +274,12 @@ impl Render for AboutPanel {
                             .flex_1()
                             .flex()
                             .flex_col()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Plasmid {}", env!("CARGO_PKG_VERSION"))))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Edict {}", env!("CARGO_PKG_VERSION"))))
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(theme::muted_text())
-                                    .child("A plasmid sequence editor built on GPUI. Third-party software and licenses:"),
+                                    .child("A DNA sequence editor built on GPUI. Third-party software and licenses:"),
                             ),
                     )
                     .child(

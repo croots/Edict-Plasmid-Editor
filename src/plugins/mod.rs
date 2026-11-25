@@ -1,4 +1,4 @@
-//! Plugins: readable Python scripts in `~/.config/plasmid-gpui/plugins/<id>/plugin.py`
+//! Plugins: readable Python scripts in `~/.config/edict/plugins/<id>/plugin.py`
 //! that add actions to the app (Predict structure on a CDS's right-click menu).
 //!
 //! A plugin's manifest (see `manifest`) says which Python environment it runs in,
@@ -77,7 +77,7 @@ pub struct Registry {
 
 impl Global for Registry {}
 
-/// `~/.config/plasmid-gpui/plugins`, next to settings.conf.
+/// `~/.config/edict/plugins`, next to settings.conf.
 pub fn plugins_dir() -> Option<PathBuf> {
     Some(crate::settings::config_path()?.parent()?.join("plugins"))
 }
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn scans_and_installs() {
-        let dir = std::env::temp_dir().join(format!("plasmid-plugins-scan-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("edict-plugins-scan-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(dir.join("broken")).unwrap();
         std::fs::write(dir.join("broken/plugin.py"), "print('no manifest')").unwrap();

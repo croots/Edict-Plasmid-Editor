@@ -1,4 +1,4 @@
-//! A plugin's manifest: the `[tool.plasmid]` table of the PEP 723 block at the top
+//! A plugin's manifest: the `[tool.edict]` table of the PEP 723 block at the top
 //! of its `plugin.py`. The same block's `dependencies` are what `uv run --script`
 //! installs, so one readable file says what the plugin needs and what it does.
 //!
@@ -7,16 +7,16 @@
 //! # requires-python = ">=3.10"
 //! # dependencies = ["esm==3.5.0"]
 //! #
-//! # [tool.plasmid]
+//! # [tool.edict]
 //! # id = "esmfold2"
 //! # name = "ESMFold2"
 //! # api = 1
 //! #
-//! # [[tool.plasmid.env]]            # tried in order; the first one present is used
+//! # [[tool.edict.env]]            # tried in order; the first one present is used
 //! # kind = "conda"
 //! # name = "esmfold2"
 //! #
-//! # [[tool.plasmid.action]]
+//! # [[tool.edict.action]]
 //! # id = "predict"
 //! # label = "Predict structure (ESMFold2)"
 //! # on = "feature"
@@ -24,7 +24,7 @@
 //! # input = "protein"
 //! # output = "structure"
 //! #
-//! # [[tool.plasmid.setting]]
+//! # [[tool.edict.setting]]
 //! # key = "model"
 //! # label = "Model"
 //! # type = "choice"
@@ -313,8 +313,8 @@ fn valid_id(s: &str) -> bool {
 pub fn parse(source: &str) -> Result<Manifest> {
     let block = script_block(source).context("no `# /// script` block at the top of the file")?;
     let block: ScriptBlock = toml::from_str(&block).context("the script block isn't valid TOML")?;
-    let table = block.tool.get("plasmid").cloned().context("the script block has no [tool.plasmid] table")?;
-    let m: Manifest = table.try_into().context("in [tool.plasmid]")?;
+    let table = block.tool.get("edict").cloned().context("the script block has no [tool.edict] table")?;
+    let m: Manifest = table.try_into().context("in [tool.edict]")?;
     check(&m)?;
     Ok(m)
 }
@@ -327,7 +327,7 @@ fn check(m: &Manifest) -> Result<()> {
         bail!("id {:?}: use lowercase letters, digits, - and _", m.id);
     }
     if m.actions.is_empty() {
-        bail!("no [[tool.plasmid.action]]: the plugin wouldn't appear anywhere");
+        bail!("no [[tool.edict.action]]: the plugin wouldn't appear anywhere");
     }
     let mut seen = Vec::new();
     for a in &m.actions {
@@ -378,19 +378,19 @@ mod tests {
 # requires-python = ">=3.10"
 # dependencies = ["numpy"]
 #
-# [tool.plasmid]
+# [tool.edict]
 # id = "toy"
 # name = "Toy"
 # api = 1
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "conda"
 # name = "toy"
 #
-# [[tool.plasmid.env]]
+# [[tool.edict.env]]
 # kind = "uv"
 #
-# [[tool.plasmid.action]]
+# [[tool.edict.action]]
 # id = "fold"
 # label = "Fold it"
 # on = "feature"
@@ -398,14 +398,14 @@ mod tests {
 # input = "protein"
 # output = "structure"
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "model"
 # label = "Model"
 # type = "choice"
 # choices = [{ value = "fast", label = "Fast" }, "full"]
 # default = "fast"
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "floor"
 # label = "RAM floor"
 # type = "float"

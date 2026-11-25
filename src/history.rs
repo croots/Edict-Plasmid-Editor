@@ -1,6 +1,6 @@
 //! The History pane: the document's change log, one entry per save, newest first.
 //!
-//! The log (see `pgx`) records every change a save keeps: bases (with the bases
+//! The log (see `edna`) records every change a save keeps: bases (with the bases
 //! inserted or removed), features, attached structures and the record's name, undo
 //! and redo included, each with who made it. The pane squashes everything between two
 //! saves into one entry showing its net effect, so typing a base and deleting it again
@@ -21,7 +21,7 @@ use gpui::{
 
 use crate::editor::{editor_font, menu_panel, thousands, SeqEditor};
 use crate::model::{Edit, FeatureRecord, Format, Op};
-use crate::pgx::{ChainLinking, SavePoint};
+use crate::edna::{ChainLinking, SavePoint};
 use crate::theme;
 
 const ROW_H: f32 = 40.0;
@@ -665,7 +665,7 @@ impl Render for HistoryView {
                 .text_xs()
                 .text_color(theme::muted_text())
                 .child(format!(
-                    "{} files don't keep a change history: these changes are lost when this file is saved. Save As .pgx to keep them.",
+                    "{} files don't keep a change history: these changes are lost when this file is saved. Save As .edna to keep them.",
                     format.name()
                 ))
         });
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn a_save_shows_its_net_change() {
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"AAAACCCC");
         d.saves.push(SavePoint { rev: d.revision, time: 1, author: None, label: None });
         // Type three bases, delete one of them again, and undo a stray deletion.
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn memoized_saves_match_a_fresh_replay() {
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         let mut memo = HashMap::new();
         for round in 0..4u8 {
             d.insert(0, &[b'A' + round; 3]);
@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn feature_and_structure_changes_are_logged_and_undo_cancels_them() {
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"ACGTACGTACGT");
         d.saves.push(SavePoint { rev: d.revision, time: 1, author: None, label: None });
         d.add_feature(feature("lacZ", 2, 8));
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn authors_are_recorded_and_listed_once() {
         crate::model::set_author(Some("  ada ".into()));
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"ACGT");
         d.delete(0, 1);
         crate::model::set_author(Some("grace".into()));
@@ -918,7 +918,7 @@ mod tests {
     /// Replaying the log for real and comparing against `locate` keeps the two honest.
     #[test]
     fn locate_follows_an_edit_through_later_ones() {
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"AAAAAAAAAA");
         d.insert(4, b"GGG"); // AAAAGGGAAAAAA, ix 1
         d.insert(0, b"TT"); // shifts it right by 2
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(reverts(Row::Start { edits: 0 }, &[], &[], 0, 0), vec![]);
 
         // Discarding unsaved changes puts the saved bases back, as one undo step.
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"ACGT");
         d.saves.push(save(d.revision));
         d.delete(1, 3);
@@ -970,7 +970,7 @@ mod tests {
 
     #[test]
     fn undo_appears_as_its_own_edit() {
-        let mut d = Document::new_untitled(Path::new("x.pgx"));
+        let mut d = Document::new_untitled(Path::new("x.edna"));
         d.insert(0, b"ACGT");
         d.undo();
         assert_eq!(d.history.len(), 2);

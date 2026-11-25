@@ -1,20 +1,20 @@
-"""Helpers for plasmid-gpui plugins (standard library only).
+"""Helpers for Edict plugins (standard library only).
 
-plasmid-gpui runs a plugin as ``python plugin.py run <request.json>`` in a
+Edict runs a plugin as ``python plugin.py run <request.json>`` in a
 terminal, with its working directory set to a scratch folder for the run. What
 the plugin prints is shown to the user as is (colours and progress bars work).
-Messages for the app itself go to a separate file, ``$PLASMID_EVENTS``, one JSON
+Messages for the app itself go to a separate file, ``$EDICT_EVENTS``, one JSON
 object per line; the functions here write them.
 
-    import plasmid
+    import edict
 
-    req = plasmid.request()          # {"action", "settings", "input", ...}
-    plasmid.progress("Folding")
+    req = edict.request()          # {"action", "settings", "input", ...}
+    edict.progress("Folding")
     ...
-    plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"])
+    edict.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"])
 
 A run succeeds when the plugin exits 0 after sending a result. Exiting with
-``plasmid.MEMORY_GUARD_EXIT`` tells the app a memory guard stopped it.
+``edict.MEMORY_GUARD_EXIT`` tells the app a memory guard stopped it.
 
 The app puts this file on PYTHONPATH; it is written fresh for every run, so
 plugins always get the copy matching the app's protocol.
@@ -33,7 +33,7 @@ API = 1
 MEMORY_GUARD_EXIT = 75
 GIB = 1 << 30
 
-_EVENTS = os.environ.get("PLASMID_EVENTS")
+_EVENTS = os.environ.get("EDICT_EVENTS")
 
 
 def _emit(obj: dict) -> None:
@@ -48,9 +48,9 @@ def _emit(obj: dict) -> None:
 
 def request() -> dict:
     """The run's request: action, settings (typed), input, workdir."""
-    path = os.environ.get("PLASMID_REQUEST") or (sys.argv[2] if len(sys.argv) > 2 else None)
+    path = os.environ.get("EDICT_REQUEST") or (sys.argv[2] if len(sys.argv) > 2 else None)
     if not path:
-        raise SystemExit("no request: run me from plasmid-gpui, or pass a request file")
+        raise SystemExit("no request: run me from Edict, or pass a request file")
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 

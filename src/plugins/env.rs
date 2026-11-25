@@ -42,9 +42,9 @@ pub fn expand(path: &str, plugin_dir: &Path) -> PathBuf {
 }
 
 /// The folder holding this app's flake, for `{flake}` in nix installables:
-/// `$PLASMID_FLAKE`, else the source tree the app was built from if it's still there.
+/// `$EDICT_FLAKE`, else the source tree the app was built from if it's still there.
 pub fn app_flake() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("PLASMID_FLAKE").map(PathBuf::from).filter(|p| p.join("flake.nix").is_file()) {
+    if let Some(p) = std::env::var_os("EDICT_FLAKE").map(PathBuf::from).filter(|p| p.join("flake.nix").is_file()) {
         return Some(p);
     }
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -92,7 +92,7 @@ pub fn resolve(spec: &EnvSpec, plugin_dir: &Path) -> Result<Vec<OsString>, Strin
         EnvSpec::Nix { installable } => {
             let nix = which("nix").ok_or("nix isn't on PATH")?;
             let installable = if installable.contains("{flake}") {
-                let flake = app_flake().ok_or("{flake} needs PLASMID_FLAKE set to the app's source folder")?;
+                let flake = app_flake().ok_or("{flake} needs EDICT_FLAKE set to the app's source folder")?;
                 installable.replace("{flake}", &flake.to_string_lossy())
             } else {
                 installable.clone()

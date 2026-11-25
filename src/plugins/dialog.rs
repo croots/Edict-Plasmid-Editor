@@ -12,7 +12,7 @@ use super::runner::{PluginOutput, PluginRunner, Scratch};
 use super::{Plugin, ResolvedEnv};
 use crate::editor::{thousands, EditorEvent, SeqEditor};
 use crate::model::Feature;
-use crate::pgx::{self, ChainLinking, StructureFormat};
+use crate::edna::{self, ChainLinking, StructureFormat};
 use crate::settings;
 use crate::tasks::{self, TaskId, TaskStatus};
 use crate::terminal::TerminalView;
@@ -269,8 +269,8 @@ impl PluginView {
         let source = out.source.clone().unwrap_or_else(|| self.plugin.manifest.name.clone());
         let chain = out.chains.first().cloned().unwrap_or_else(|| "A".into());
         let sid = editor.update(cx, |ed, cx| {
-            let id = pgx::structure_id(&stem, &ed.doc.structures);
-            ed.doc.add_structure(pgx::Structure {
+            let id = edna::structure_id(&stem, &ed.doc.structures);
+            ed.doc.add_structure(edna::Structure {
                 id: id.clone(),
                 name,
                 format,

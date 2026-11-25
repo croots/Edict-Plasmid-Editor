@@ -20,7 +20,7 @@ use gpui::{
 
 use crate::attach_dialog::{AttachDialog, AttachEvent};
 use crate::editor::SeqEditor;
-use crate::pgx::{ChainLinking, Structure};
+use crate::edna::{ChainLinking, Structure};
 use crate::structure::{self, ChainLink, Molecule, StructureFile};
 use crate::structure_render::{self as render, Camera, Coloring, Frame, Scene, Style, M3, V3};
 use crate::theme;

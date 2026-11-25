@@ -19,7 +19,7 @@ use crate::tasks::{self, TaskStatus};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{self, ThemeEntry, ThemeSource};
 
-actions!(plasmid, [NewFile, OpenQueued, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
+actions!(edict, [NewFile, OpenQueued, OpenFile, OpenFolder, Save, SaveAs, ExportAs, CloseTab, OpenSettings, About, Dismiss, Quit, ToggleFullScreen]);
 
 /// A document a pane wants opened in a new tab.
 pub struct NewDocument {
@@ -295,13 +295,13 @@ impl Workspace {
         self.activate(self.tabs.len() - 1, window, cx);
     }
 
-    /// A path in the folder that's neither on disk nor open: `<stem>.pgx`, or
-    /// `<stem>-2.pgx` and so on.
+    /// A path in the folder that's neither on disk nor open: `<stem>.edna`, or
+    /// `<stem>-2.edna` and so on.
     fn untitled_path(&mut self, stem: &str, cx: &App) -> PathBuf {
         let free = |p: &Path| !p.exists() && !self.tabs.iter().any(|t| t.path(cx) == p);
         if stem != "untitled" {
             for i in 1.. {
-                let name = if i == 1 { format!("{stem}.{}", crate::pgx::EXTENSION) } else { format!("{stem}-{i}.{}", crate::pgx::EXTENSION) };
+                let name = if i == 1 { format!("{stem}.{}", crate::edna::EXTENSION) } else { format!("{stem}-{i}.{}", crate::edna::EXTENSION) };
                 let p = self.root.join(name);
                 if free(&p) {
                     return p;
@@ -310,7 +310,7 @@ impl Workspace {
         }
         loop {
             self.untitled_count += 1;
-            let p = self.root.join(format!("untitled-{}.{}", self.untitled_count, crate::pgx::EXTENSION));
+            let p = self.root.join(format!("untitled-{}.{}", self.untitled_count, crate::edna::EXTENSION));
             if free(&p) {
                 return p;
             }
@@ -385,7 +385,7 @@ impl Workspace {
 
     fn update_title(&self, window: &mut Window) {
         let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.root.display().to_string());
-        window.set_window_title(&format!("{name} — Plasmid Editor"));
+        window.set_window_title(&format!("{name} — Edict"));
     }
 
     fn active_editor(&self) -> Option<Entity<SeqEditor>> {
@@ -1324,7 +1324,7 @@ impl Workspace {
                     ),
             )
             .child(div().text_xs().text_color(theme::muted_text()).child(
-                "BLAST searches send this address to NCBI with the tool name (plasmid-gpui), as NCBI's usage rules ask, \
+                "BLAST searches send this address to NCBI with the tool name (edict), as NCBI's usage rules ask, \
                  so they can get in touch about a problem before blocking heavy use. It goes nowhere else.",
             ))
             .when(missing, |d| {

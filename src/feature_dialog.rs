@@ -13,7 +13,7 @@ use gpui::{
 use std::rc::Rc;
 
 use crate::model::{self, Document, Feature};
-use crate::pgx::{ChainLinking, Structure, STRUCTURE_QUALIFIER};
+use crate::edna::{ChainLinking, Structure, STRUCTURE_QUALIFIER};
 use crate::structure::{self, StructureFile};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme;

@@ -1,7 +1,7 @@
 //! Colors. The active theme lives in a thread-local (all painting happens on the UI
 //! thread), so drawing code keeps calling `theme::text()` and friends.
 //!
-//! Themes are either the built-in "Plasmid Light" palette (loosely modelled on
+//! Themes are either the built-in "Edict Light" palette (loosely modelled on
 //! Benchling) or any base16 scheme: the ~370 bundled from tinted-theming/schemes, or
 //! YAML files the user points at in Settings.
 
@@ -16,7 +16,7 @@ mod bundled {
     include!(concat!(env!("OUT_DIR"), "/bundled_themes.rs"));
 }
 
-pub const DEFAULT_THEME_ID: &str = "plasmid-light";
+pub const DEFAULT_THEME_ID: &str = "edict-light";
 
 /// Every color the UI draws with.
 #[derive(Clone)]
@@ -46,7 +46,7 @@ pub struct Theme {
 }
 
 thread_local! {
-    static CURRENT: RefCell<Rc<Theme>> = RefCell::new(Rc::new(Theme::plasmid_light()));
+    static CURRENT: RefCell<Rc<Theme>> = RefCell::new(Rc::new(Theme::edict_light()));
 }
 
 pub fn set(theme: Theme) {
@@ -127,7 +127,7 @@ fn contrast(l1: f32, l2: f32) -> f32 {
 }
 
 impl Theme {
-    pub fn plasmid_light() -> Self {
+    pub fn edict_light() -> Self {
         Self {
             app_bg: c(0xf4f5f7),
             panel: c(0xf7f8fa),
@@ -212,7 +212,7 @@ pub enum ThemeSource {
 /// One selectable theme.
 #[derive(Clone, Debug)]
 pub struct ThemeEntry {
-    /// Stable key saved in settings: `plasmid-light`, `base16:<slug>`, `file:<path>`.
+    /// Stable key saved in settings: `edict-light`, `base16:<slug>`, `file:<path>`.
     pub id: String,
     pub name: String,
     pub dark: bool,
@@ -225,7 +225,7 @@ impl ThemeEntry {
     pub fn theme(&self) -> Theme {
         match &self.palette {
             Some(p) => Theme::from_base16(p),
-            None => Theme::plasmid_light(),
+            None => Theme::edict_light(),
         }
     }
 
@@ -289,7 +289,7 @@ pub fn bundled_themes() -> Vec<ThemeEntry> {
         0,
         ThemeEntry {
             id: DEFAULT_THEME_ID.into(),
-            name: "Plasmid Light (default)".into(),
+            name: "Edict Light (default)".into(),
             dark: false,
             source: ThemeSource::Builtin,
             palette: None,

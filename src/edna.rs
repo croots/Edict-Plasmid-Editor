@@ -40,9 +40,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::model::{self, Edit};
 
-pub const EXTENSION: &str = "pgx";
-pub const MIME_TYPE: &str = "application/vnd.plasmid-gpui+zip";
-pub const FORMAT_NAME: &str = "plasmid-gpui";
+pub const EXTENSION: &str = "edna";
+pub const MIME_TYPE: &str = "application/vnd.edict.edna+zip";
+pub const FORMAT_NAME: &str = "edna";
 /// 2: the log records feature, structure and name changes too, and who made each one.
 pub const FORMAT_VERSION: u32 = 2;
 
@@ -156,7 +156,7 @@ pub struct SavePoint {
     pub label: Option<String>,
 }
 
-/// Everything a `.pgx` holds. `record` carries the sequence, features and metadata.
+/// Everything a `.edna` holds. `record` carries the sequence, features and metadata.
 pub struct Bundle {
     pub record: Seq,
     pub revision: u64,
@@ -610,7 +610,7 @@ mod tests {
     fn refuses_newer_versions_and_foreign_zips() {
         let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
         zip.start_file("manifest.json", SimpleFileOptions::default()).unwrap();
-        zip.write_all(br#"{"format":"plasmid-gpui","format_version":99}"#).unwrap();
+        zip.write_all(br#"{"format":"edna","format_version":99}"#).unwrap();
         let bytes = zip.finish().unwrap().into_inner();
         let err = read(&bytes).err().unwrap().to_string();
         assert!(err.contains("newer"), "{err}");

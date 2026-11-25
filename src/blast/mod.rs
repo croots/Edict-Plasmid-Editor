@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::tasks::{Output, TaskCtx, TaskRunner};
 
 pub const ENDPOINT: &str = "https://blast.ncbi.nlm.nih.gov/Blast.cgi";
-pub const TOOL: &str = "plasmid-gpui";
+pub const TOOL: &str = "edict";
 /// NCBI: no more than one request every 10 seconds.
 const REQUEST_GAP: Duration = Duration::from_secs(10);
 /// NCBI: don't check on a search more than once a minute.
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(get("FILTER"), Some("mL"));
         assert_eq!(get("NUCL_PENALTY"), Some("-2"));
         assert_eq!(get("email"), Some("a@b.c"));
-        assert_eq!(get("tool"), Some("plasmid-gpui"));
+        assert_eq!(get("tool"), Some("edict"));
         assert_eq!(
             get("ENTREZ_QUERY"),
             Some("(\"Escherichia coli\"[Organism] OR txid9606[Organism:exp]) NOT \"uncultured bacterium\"[Organism]")

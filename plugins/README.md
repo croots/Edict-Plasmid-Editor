@@ -1,10 +1,10 @@
-# Writing a plasmid-gpui plugin
+# Writing an Edict plugin
 
 A plugin is one Python file, `plugin.py`, in its own folder under
-`~/.config/plasmid-gpui/plugins/` (`$XDG_CONFIG_HOME/plasmid-gpui/plugins/`):
+`~/.config/edict/plugins/` (`$XDG_CONFIG_HOME/edict/plugins/`):
 
 ```text
-~/.config/plasmid-gpui/plugins/
+~/.config/edict/plugins/
   esmfold2/plugin.py
   ideal-helix/plugin.py
   my-plugin/plugin.py      # plus anything else it needs (a .venv, data files)
@@ -21,24 +21,24 @@ needs only the standard library. [`esmfold2/plugin.py`](esmfold2/plugin.py) is a
 ## The manifest
 
 The file starts with a [PEP 723](https://peps.python.org/pep-0723/) `# /// script`
-block. `uv` reads `dependencies` from it, and the app reads `[tool.plasmid]`:
+block. `uv` reads `dependencies` from it, and the app reads `[tool.edict]`:
 
 ```python
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["numpy"]
 #
-# [tool.plasmid]
+# [tool.edict]
 # id = "my-plugin"            # must be unique among installed plugins
 # name = "My plugin"          # shown in menus, the task list and Settings
 # api = 1                     # the protocol version below
 # version = "0.1"             # optional
 # description = "What it does."
 #
-# [[tool.plasmid.env]]        # where to run, in order of preference (see below)
+# [[tool.edict.env]]        # where to run, in order of preference (see below)
 # kind = "uv"
 #
-# [[tool.plasmid.action]]
+# [[tool.edict.action]]
 # id = "predict"
 # label = "Predict structure…"   # the item under right-click → Plugins
 # on = "feature"
@@ -46,7 +46,7 @@ block. `uv` reads `dependencies` from it, and the app reads `[tool.plasmid]`:
 # input = "protein"              # the feature, translated with its genetic code
 # output = "structure"
 #
-# [[tool.plasmid.setting]]
+# [[tool.edict.setting]]
 # key = "seed"
 # label = "Seed"
 # type = "int"                # choice | bool | int | float | string
@@ -74,7 +74,7 @@ or is cancelled), so the structure still matches the feature when it is attached
 
 ## Environments
 
-Each `[[tool.plasmid.env]]` entry is one way to get a Python. The app uses the first one
+Each `[[tool.edict.env]]` entry is one way to get a Python. The app uses the first one
 that is available on this machine. In **Settings → Plugins**, the user can pin one
 instead.
 
@@ -86,13 +86,13 @@ instead.
 | `nix` | `installable` | `nix shell <installable> -c python`; `{flake}` stands for this app's flake |
 | `python` | `path` | that interpreter, by path or by name on `PATH` (`python3`) |
 
-`{flake}` is `$PLASMID_FLAKE` if set, otherwise the source tree the app was built from.
+`{flake}` is `$EDICT_FLAKE` if set, otherwise the source tree the app was built from.
 This flake's `esmfold2-env` package is the ESMFold2 plugin's first choice.
 
 ## The protocol
 
 The app runs `<env> plugin.py run <request.json>` on a terminal (a pty), in a scratch
-folder made for the run: `~/.cache/plasmid-gpui/tasks/<id>-…/`. The user sees the
+folder made for the run: `~/.cache/edict/tasks/<id>-…/`. The user sees the
 terminal, so print freely; colours and progress bars work. The folder is deleted when the
 result is dismissed.
 
@@ -108,26 +108,26 @@ result is dismissed.
     "feature": {"label": "GFP", "kind": "CDS"},
     "doc_name": "pEGFP-N1"
   },
-  "workdir": "/home/…/.cache/plasmid-gpui/tasks/…"
+  "workdir": "/home/…/.cache/edict/tasks/…"
 }
 ```
 
 Settings arrive already typed (numbers as numbers, bools as bools). The environment also
-has `PLASMID_REQUEST`, `PLASMID_EVENTS`, `PLASMID_WORKDIR` and `PLASMID_API` set, with
+has `EDICT_REQUEST`, `EDICT_EVENTS`, `EDICT_WORKDIR` and `EDICT_API` set, with
 `PYTHONUNBUFFERED=1`.
 
-The plugin talks to the app by appending JSON lines to `$PLASMID_EVENTS`. The bundled
-helper module writes them for you: `import plasmid` works because the app puts
-[`plasmid.py`](plasmid.py) on `PYTHONPATH`, fresh for every run.
+The plugin talks to the app by appending JSON lines to `$EDICT_EVENTS`. The bundled
+helper module writes them for you: `import edict` works because the app puts
+[`edict.py`](edict.py) on `PYTHONPATH`, fresh for every run.
 
 ```python
-import plasmid
+import edict
 
-req = plasmid.request()
-plasmid.progress("Folding", 0.5)      # the line above the terminal; fraction optional
-plasmid.warn("no GPU; using the CPU") # printed, and kept as the reason if the run fails
-plasmid.fail("sequence too long")     # exits now; the message is the reason shown
-plasmid.result(
+req = edict.request()
+edict.progress("Folding", 0.5)      # the line above the terminal; fraction optional
+edict.warn("no GPU; using the CPU") # printed, and kept as the reason if the run fails
+edict.fail("sequence too long")     # exits now; the message is the reason shown
+edict.result(
     kind="structure",
     file="prediction.cif",            # inside the run folder
     format="mmcif",                   # or "pdb"
@@ -140,7 +140,7 @@ plasmid.result(
 
 A run succeeds when the plugin sends a `result` and exits with status 0. A non-zero exit
 fails the run, and the last `error` (or `warn`) becomes the reason shown. Exit status 75
-(`plasmid.MEMORY_GUARD_EXIT`) means a memory guard stopped the run on purpose.
+(`edict.MEMORY_GUARD_EXIT`) means a memory guard stopped the run on purpose.
 
 The structure is checked before it is offered. It must parse, and its protein chain must
 match the protein that was sent. The user can then attach it to the feature, save the
@@ -158,7 +158,7 @@ the first thing the OOM killer picks (`oom_score_adj` 1000), and the helper offe
 guard that stops the run first:
 
 ```python
-with plasmid.RamGuard(floor=2 * plasmid.GIB, what="my model"):
+with edict.RamGuard(floor=2 * edict.GIB, what="my model"):
     model = load()          # exits with status 75 and a clear message if free RAM
     run(model)              # drops below the floor
 ```
@@ -171,8 +171,8 @@ on `torch.OutOfMemoryError`.
 ## Trying a plugin outside the app
 
 ```sh
-cd "$(mktemp -d)" && mkdir .plasmid && cp path/to/plugins/plasmid.py .plasmid/
-# write .plasmid/request.json as above, then:
-PYTHONPATH=$PWD/.plasmid PLASMID_EVENTS=$PWD/.plasmid/events.jsonl python path/to/plugin.py run .plasmid/request.json
-cat .plasmid/events.jsonl
+cd "$(mktemp -d)" && mkdir .edict && cp path/to/plugins/edict.py .edict/
+# write .edict/request.json as above, then:
+PYTHONPATH=$PWD/.edict EDICT_EVENTS=$PWD/.edict/events.jsonl python path/to/plugin.py run .edict/request.json
+cat .edict/events.jsonl
 ```

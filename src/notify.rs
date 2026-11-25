@@ -15,13 +15,13 @@ fn show(summary: &str, body: &str) -> anyhow::Result<()> {
     use std::collections::HashMap;
     use zbus::zvariant::Value;
     let conn = zbus::blocking::Connection::session()?;
-    let hints: HashMap<&str, Value> = HashMap::from([("desktop-entry", Value::from("plasmid-gpui"))]);
+    let hints: HashMap<&str, Value> = HashMap::from([("desktop-entry", Value::from("edict"))]);
     conn.call_method(
         Some("org.freedesktop.Notifications"),
         "/org/freedesktop/Notifications",
         Some("org.freedesktop.Notifications"),
         "Notify",
-        &("Plasmid Editor", 0u32, "", summary, body, Vec::<&str>::new(), hints, -1i32),
+        &("Edict", 0u32, "", summary, body, Vec::<&str>::new(), hints, -1i32),
     )?;
     Ok(())
 }
@@ -30,7 +30,7 @@ fn show(summary: &str, body: &str) -> anyhow::Result<()> {
 fn show(summary: &str, body: &str) -> anyhow::Result<()> {
     // AppleScript string literals: escape backslashes and quotes.
     let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
-    let script = format!("display notification {} with title \"Plasmid Editor\" subtitle {}", q(body), q(summary));
+    let script = format!("display notification {} with title \"Edict\" subtitle {}", q(body), q(summary));
     let status = std::process::Command::new("osascript").arg("-e").arg(script).status()?;
     anyhow::ensure!(status.success(), "osascript exited with {status}");
     Ok(())
@@ -42,7 +42,7 @@ mod tests {
     #[test]
     #[ignore]
     fn shows_one() {
-        super::show("BLASTX finished", "Test notification from plasmid-gpui").unwrap();
+        super::show("BLASTX finished", "Test notification from Edict").unwrap();
     }
 }
 

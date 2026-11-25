@@ -1058,7 +1058,7 @@ mod tests {
 
     #[test]
     fn cartoon_meshes_egfp() {
-        use crate::pgx::StructureFormat;
+        use crate::edna::StructureFormat;
         let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/samples/2Y0G.pdb")).unwrap();
         let mol = Molecule::parse(&bytes, StructureFormat::Pdb).unwrap();
         assert!(mol.residues.iter().filter(|r| r.carbonyl.is_some()).count() > 200);
@@ -1102,7 +1102,7 @@ mod tests {
 #[cfg(test)]
 mod preview {
     use super::*;
-    use crate::pgx::StructureFormat;
+    use crate::edna::StructureFormat;
 
     #[test]
     #[ignore]
@@ -1145,7 +1145,7 @@ mod preview {
 #[cfg(test)]
 mod bench {
     use super::*;
-    use crate::pgx::StructureFormat;
+    use crate::edna::StructureFormat;
 
     #[test]
     #[ignore]
