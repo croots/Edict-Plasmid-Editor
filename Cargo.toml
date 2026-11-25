@@ -21,6 +21,9 @@ portable-pty = "0.9"
 async-channel = "2"
 # BLAST searches at NCBI. Already in the tree (ghostty-vt-sys downloads with it).
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Plugin manifests: the [tool.plasmid] table of a plugin script's PEP 723 block.
+# Already in the tree (through gpui).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [target.'cfg(unix)'.dependencies]
 # localtime_r, for dating BLAST notes in the local time zone.

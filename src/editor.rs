@@ -547,6 +547,31 @@ impl SeqEditor {
         });
     }
 
+    /// Run a plugin's action on feature `fi`: open its dialog as a new task.
+    fn run_plugin(&mut self, plugin: std::sync::Arc<crate::plugins::Plugin>, action: crate::plugins::manifest::Action, fi: usize, cx: &mut Context<Self>) {
+        use crate::plugins::dialog::{PluginView, Target};
+        let Some(feature) = self.doc.features.get(fi).cloned() else { return };
+        let protein = match Target::protein(&self.doc.seq, &feature) {
+            Ok(p) => p,
+            Err(e) => {
+                self.message = Some(format!("{}: {e}", action.label.trim_end_matches('…')).into());
+                return cx.notify();
+            }
+        };
+        let target = Target { feature_ix: fi, feature, protein, doc_name: self.doc.name.clone() };
+        let editor = cx.entity().downgrade();
+        let title = format!("{} · {}", action.label.trim_end_matches('…'), target.feature.label);
+        tasks::manager(cx).update(cx, |m, cx| {
+            m.create(
+                plugin.manifest.name.clone(),
+                title,
+                editor.clone(),
+                |id, cx| cx.new(|cx| PluginView::new(id, editor, plugin, action, target, cx)).into(),
+                cx,
+            );
+        });
+    }
+
     /// Open the Create Feature dialog filled in from elsewhere (a BLAST match).
     #[allow(clippy::too_many_arguments)]
     pub fn create_feature_from(
@@ -870,6 +895,40 @@ impl SeqEditor {
             ]
         });
 
+        // Plugin actions for the right-clicked feature (only feature actions on
+        // protein exist so far).
+        let kind = menu.feature.and_then(|fi| self.doc.features.get(fi)).map(|f| f.kind.clone());
+        let installed = cx.try_global::<crate::plugins::Registry>().is_some_and(|r| !r.plugins.is_empty());
+        let actions: Vec<_> = kind
+            .as_deref()
+            .map(|k| crate::plugins::actions_for(k, cx))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, a)| a.on == "feature" && a.input == "protein")
+            .collect();
+        let mut plugin_items: Vec<AnyElement> = Vec::new();
+        for (k, (plugin, action)) in actions.into_iter().enumerate() {
+            let fi = menu.feature.unwrap_or(0);
+            plugin_items.push(
+                item_owned(("menu-plugin", k), action.label.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.run_plugin(plugin.clone(), action.clone(), fi, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if plugin_items.is_empty() {
+            let why = if !installed {
+                "No plugins installed (Settings → Plugins)"
+            } else if kind.is_none() {
+                "Right-click a feature for its plugins"
+            } else {
+                "No plugins for this feature"
+            };
+            plugin_items.push(item("menu-plugins-none", why, "", false).into_any_element());
+        }
         let plugins = div()
             .relative()
             .child(
@@ -889,7 +948,7 @@ impl SeqEditor {
                         .top(px(-5.0))
                         .left_full()
                         .ml_1()
-                        .child(item("menu-plugins-none", "No plugins installed", "", false)),
+                        .children(plugin_items),
                 )
             });
 

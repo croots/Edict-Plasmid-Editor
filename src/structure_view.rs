@@ -178,7 +178,7 @@ impl StructureView {
                     .fold(0.0f32, f32::max)
                     + 2.0;
                 let home = render::principal_axes(&pts, center);
-                let alphafold = mol.title.to_ascii_lowercase().contains("alphafold");
+                let alphafold = ["alphafold", "esmfold", "plddt"].iter().any(|k| mol.title.to_ascii_lowercase().contains(k));
                 Ok(Rc::new(Loaded { mol: Rc::new(mol), center, radius, home, alphafold }))
             })
             .clone()

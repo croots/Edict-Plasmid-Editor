@@ -35,7 +35,45 @@ const DEFAULT_FONT: f32 = 13.0;
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 32.0;
 
-/// The running shell.
+/// A process on a pty, opened elsewhere (a plugin run's worker thread) and handed to a
+/// terminal to show. `output` carries what the process writes (see `pump_reader`).
+pub struct PtyHandoff {
+    pub master: Box<dyn MasterPty + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
+    pub output: async_channel::Receiver<Vec<u8>>,
+}
+
+/// Copy everything `reader` gives into a channel until EOF, on its own thread.
+pub fn pump_reader(mut reader: Box<dyn Read + Send>, name: &str) -> std::io::Result<async_channel::Receiver<Vec<u8>>> {
+    let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
+    std::thread::Builder::new().name(name.into()).spawn(move || {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send_blocking(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })?;
+    Ok(rx)
+}
+
+/// What the terminal runs, and what happens once the process ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// The user's shell, restarted with Enter after it exits.
+    Shell,
+    /// The output of a process someone else runs (a plugin); it stays readable after
+    /// the process ends, and nothing restarts.
+    Output,
+}
+
+/// The process the terminal is attached to.
 struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -57,6 +95,7 @@ pub struct TerminalView {
     keys: key::Encoder,
     key_event: key::Event,
     pty: Option<Pty>,
+    mode: Mode,
     cwd: PathBuf,
     focus: FocusHandle,
     /// Grid size in cells, as last given to the terminal and the pty.
@@ -78,10 +117,24 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(cwd: PathBuf, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::blank(Mode::Shell, cwd, cx);
+        this.start_shell(cx);
+        this
+    }
+
+    /// A terminal for a process's output, attached later with `attach`. It doesn't
+    /// take focus, so typing stays where it was.
+    pub fn output(cx: &mut Context<Self>) -> Self {
+        let mut this = Self::blank(Mode::Output, PathBuf::new(), cx);
+        this.focus_pending = false;
+        this
+    }
+
+    fn blank(mode: Mode, cwd: PathBuf, cx: &mut Context<Self>) -> Self {
         let grid = (80, 24);
         let term = Terminal::new(TerminalOptions { cols: grid.0, rows: grid.1, ..Default::default() })
             .expect("libghostty-vt terminal");
-        let mut this = Self {
+        Self {
             term,
             render: RenderState::new().expect("render state"),
             rows: RowIterator::new().expect("row iterator"),
@@ -89,6 +142,7 @@ impl TerminalView {
             keys: key::Encoder::new().expect("key encoder"),
             key_event: key::Event::new().expect("key event"),
             pty: None,
+            mode,
             cwd,
             focus: cx.focus_handle(),
             grid,
@@ -100,9 +154,57 @@ impl TerminalView {
             builtin_palette: None,
             focus_pending: true,
             _reader: None,
-        };
-        this.start_shell(cx);
-        this
+        }
+    }
+
+    /// The grid size the terminal has now (cols, rows), to open a pty at.
+    pub fn grid(&self) -> (u16, u16) {
+        self.grid
+    }
+
+    /// Show `pty`'s process: its output is fed in, keys typed here go to it.
+    pub fn attach(&mut self, pty: PtyHandoff, cx: &mut Context<Self>) {
+        let (cols, rows) = self.grid;
+        pty.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).ok();
+        let rx = pty.output;
+        self.status = None;
+        self._reader = Some(cx.spawn(async move |this, cx| {
+            while let Ok(mut bytes) = rx.recv().await {
+                // Coalesce whatever else already arrived into one update.
+                while let Ok(more) = rx.try_recv() {
+                    bytes.extend_from_slice(&more);
+                }
+                if this.update(cx, |t, cx| t.feed(&bytes, cx)).is_err() {
+                    return;
+                }
+            }
+            this.update(cx, |t, cx| {
+                t.pty = None;
+                if t.mode == Mode::Shell {
+                    t.status = Some("Process exited · press Enter to restart".into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        self.pty = Some(Pty { master: pty.master, writer: pty.writer, killer: pty.killer });
+        cx.notify();
+    }
+
+    /// Show text as if the process had written it (newlines become CRLF).
+    pub fn print(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        self.feed(bytes.as_bytes(), cx);
+    }
+
+    pub fn status_is_none(&self) -> bool {
+        self.status.is_none()
+    }
+
+    /// The note in the corner ("Stopped"), or none.
+    pub fn set_status(&mut self, status: Option<String>, cx: &mut Context<Self>) {
+        self.status = status;
+        cx.notify();
     }
 
     /// The title the shell set (OSC 0/2), for the pane header.
@@ -125,6 +227,24 @@ impl TerminalView {
         if self.cwd.is_dir() {
             cmd.cwd(&self.cwd);
         }
+        Self::terminal_env(&mut cmd);
+        let child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let killer = child.clone_killer();
+        let reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+        // Reap the shell once it exits, so it doesn't linger as a zombie.
+        std::thread::Builder::new().name("terminal-wait".into()).spawn(move || {
+            let mut child = child;
+            child.wait().ok();
+        })?;
+        let output = pump_reader(reader, "terminal-pty")?;
+        self.attach(PtyHandoff { master: pair.master, writer, killer, output }, cx);
+        Ok(())
+    }
+
+    /// The environment a program expects from this terminal (TERM and friends).
+    pub fn terminal_env(cmd: &mut CommandBuilder) {
         // Ghostty's own terminfo describes exactly what libghostty-vt understands.
         match ghostty_vt::terminfo::dir() {
             Ok(dir) => {
@@ -135,48 +255,6 @@ impl TerminalView {
         }
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "plasmid-gpui");
-        let child = pair.slave.spawn_command(cmd)?;
-        drop(pair.slave);
-        let killer = child.clone_killer();
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-
-        let (tx, rx) = async_channel::unbounded::<Vec<u8>>();
-        std::thread::Builder::new().name("terminal-pty".into()).spawn(move || {
-            let mut child = child;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.send_blocking(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            child.wait().ok();
-        })?;
-
-        self._reader = Some(cx.spawn(async move |this, cx| {
-            while let Ok(mut bytes) = rx.recv().await {
-                // Coalesce whatever else already arrived into one update.
-                while let Ok(more) = rx.try_recv() {
-                    bytes.extend_from_slice(&more);
-                }
-                if this.update(cx, |t, cx| t.feed(&bytes, cx)).is_err() {
-                    return;
-                }
-            }
-            this.update(cx, |t, cx| {
-                t.pty = None;
-                t.status = Some("Process exited · press Enter to restart".into());
-                cx.notify();
-            })
-            .ok();
-        }));
-        self.pty = Some(Pty { master: pair.master, writer, killer });
-        Ok(())
     }
 
     fn feed(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -294,7 +372,7 @@ impl TerminalView {
             }
         }
         if self.pty.is_none() {
-            if ks.key == "enter" {
+            if ks.key == "enter" && self.mode == Mode::Shell {
                 self.term.reset();
                 self.start_shell(cx);
             }

@@ -55,6 +55,9 @@
         packages.esmfold2 = esmfold2.predict;
         packages.esmfold2-cpu = esmfold2-cpu.predict;
         apps.esmfold2 = { type = "app"; program = "${esmfold2.predict}/bin/esmfold2-predict"; };
+        # The Python the ESMFold2 plugin runs in (`nix shell .#esmfold2-env -c python`).
+        packages.esmfold2-env = esmfold2.env;
+        packages.esmfold2-cpu-env = esmfold2-cpu.env;
 
         # `nix develop .#esmfold2`: Python with `esm` importable, plus the CLI.
         devShells.esmfold2 = pkgs.mkShell {

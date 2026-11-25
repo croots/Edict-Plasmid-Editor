@@ -106,6 +106,7 @@ enum SettingsPage {
     Appearance,
     Hotkeys,
     Keys,
+    Plugins,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -173,6 +174,11 @@ impl Workspace {
                         0 => "no matches".to_string(),
                         1 => "1 match".to_string(),
                         n => format!("{n} matches"),
+                    });
+                    let found = found.or_else(|| {
+                        let o = t.output.clone()?.downcast::<crate::plugins::runner::PluginOutput>().ok()?;
+                        let metrics: Vec<String> = o.metrics.iter().map(|(k, v)| format!("{k} {v:.2}")).collect();
+                        Some(if metrics.is_empty() { "structure ready".to_string() } else { format!("structure ready · {}", metrics.join(" · ")) })
                     });
                     let body = match found {
                         Some(f) => format!("{}: {f}", t.title),
@@ -633,6 +639,7 @@ impl Workspace {
         let shared = settings::shared();
         self.settings.blast = shared.blast;
         self.settings.favorite_enzymes = shared.favorite_enzymes;
+        self.settings.plugins = shared.plugins;
         settings::set_shared(self.settings.clone());
         if let Err(e) = self.settings.save() {
             self.set_notice(format!("Settings not saved: {e:#}"), cx);
@@ -1007,6 +1014,7 @@ impl Workspace {
         let current = self.settings.theme.clone();
         let current_name = self.themes.iter().find(|t| t.id == current).map(|t| t.name.clone()).unwrap_or_default();
         let custom_count = self.themes.iter().filter(|t| matches!(t.source, ThemeSource::Custom(_))).count();
+        let plugins_page = (self.settings_page == SettingsPage::Plugins).then(|| self.plugins_page(cx));
 
         let chip = |id: &'static str, label: String, f: ThemeFilter, selected: bool| {
             div()
@@ -1142,6 +1150,7 @@ impl Workspace {
                     .child(page_tab("page-appearance", "Appearance", SettingsPage::Appearance, self.settings_page))
                     .child(page_tab("page-hotkeys", "Hotkeys", SettingsPage::Hotkeys, self.settings_page))
                     .child(page_tab("page-keys", "Keys", SettingsPage::Keys, self.settings_page))
+                    .child(page_tab("page-plugins", "Plugins", SettingsPage::Plugins, self.settings_page))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1157,6 +1166,7 @@ impl Workspace {
             )
             .when(self.settings_page == SettingsPage::Hotkeys, |d| d.child(hotkeys_page()))
             .when(self.settings_page == SettingsPage::Keys, |d| d.child(self.keys_page()))
+            .children(plugins_page)
             .when(self.settings_page == SettingsPage::Appearance, |d| {
                 // Theme picker
                 d.child(
@@ -1320,6 +1330,163 @@ impl Workspace {
             .when(missing, |d| {
                 d.child(div().text_xs().text_color(theme::error()).child("BLAST needs an email address before it can run."))
             })
+    }
+}
+
+impl Workspace {
+    /// Settings → Plugins: what's installed, where each will run, and what failed to load.
+    fn plugins_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let heading = |text: String| div().text_xs().font_weight(gpui::FontWeight::SEMIBOLD).text_color(theme::muted_text()).child(text);
+        let small = |text: String| div().text_xs().text_color(theme::muted_text()).child(text);
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .border_1()
+                .border_color(theme::border())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .child(label)
+        };
+        let chip = |id: (&'static str, usize), label: String, on: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .py(px(2.0))
+                .rounded_md()
+                .border_1()
+                .text_xs()
+                .cursor_pointer()
+                .when(on, |d| d.border_color(theme::accent()).bg(theme::accent()).text_color(theme::editor_bg()))
+                .when(!on, |d| d.border_color(theme::border()).hover(|s| s.bg(theme::hover())))
+                .child(label)
+        };
+        let dir = crate::plugins::plugins_dir();
+        let (plugins, problems) = match cx.try_global::<crate::plugins::Registry>() {
+            Some(r) => (r.plugins.clone(), r.problems.iter().map(|p| format!("{}: {}", p.path.display(), p.error)).collect::<Vec<_>>()),
+            None => (Vec::new(), Vec::new()),
+        };
+
+        let mut list = div().id("plugins-list").flex().flex_col().gap_3().flex_1().min_h_0().overflow_y_scroll();
+        if plugins.is_empty() {
+            list = list.child(small(
+                "No plugins installed. A plugin is a folder holding a plugin.py; \
+                 Install bundled plugins adds ESMFold2 and a small demo."
+                    .into(),
+            ));
+        }
+        for (pi, p) in plugins.iter().enumerate() {
+            let id = p.id().to_string();
+            let chosen = p.saved().get("env").cloned();
+            let status = match p.resolve_env() {
+                Ok((spec, _)) => div().text_xs().text_color(theme::muted_text()).child(format!("Runs in {}", spec.describe())),
+                Err(why) => div().text_xs().text_color(theme::error()).child(format!("No usable environment: {}", why.join("; "))),
+            };
+            let mut envs = div().flex().flex_row().flex_wrap().gap_1().child(
+                chip(("plugin-env-auto", pi * 100), "Auto".into(), chosen.is_none()).on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| this.set_plugin_env(&id, None, cx)
+                })),
+            );
+            for (k, spec) in p.manifest.env.iter().enumerate() {
+                let choice = spec.to_choice();
+                let on = chosen.as_deref() == Some(choice.as_str());
+                envs = envs.child(chip(("plugin-env", pi * 100 + k + 1), spec.describe(), on).on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| this.set_plugin_env(&id, Some(choice.clone()), cx)
+                })));
+            }
+            let actions: Vec<String> = p.manifest.actions.iter().map(|a| a.label.clone()).collect();
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .items_baseline()
+                            .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child(p.manifest.name.clone()))
+                            .child(small(format!("{}{}", id, p.manifest.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()))),
+                    )
+                    .children(p.manifest.description.clone().map(|d| div().text_xs().child(d)))
+                    .when(!actions.is_empty(), |d| d.child(small(format!("Offers: {}", actions.join(", ")))))
+                    .child(status)
+                    .child(envs),
+            );
+        }
+        if !problems.is_empty() {
+            list = list.child(heading("NOT LOADED".into()));
+            for p in problems {
+                list = list.child(div().text_xs().text_color(theme::error()).child(p));
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .h(px(470.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(small(dir.as_ref().map_or("No config folder".into(), |d| d.display().to_string()))))
+                    .child(button("plugins-open", "Open folder").on_click(cx.listener(|this, _, _, cx| {
+                        let Some(dir) = crate::plugins::plugins_dir() else { return };
+                        match std::fs::create_dir_all(&dir) {
+                            Ok(()) => cx.open_with_system(&dir),
+                            Err(e) => this.set_notice(format!("Couldn't make {}: {e}", dir.display()), cx),
+                        }
+                    })))
+                    .child(button("plugins-rescan", "Rescan").on_click(cx.listener(|_, _, _, cx| {
+                        crate::plugins::rescan(cx);
+                        cx.notify();
+                    })))
+                    .child(button("plugins-install", "Install bundled plugins").on_click(cx.listener(|this, _, _, cx| {
+                        let Some(dir) = crate::plugins::plugins_dir() else { return };
+                        let msg = match crate::plugins::install_bundled(&dir) {
+                            Ok(done) if done.is_empty() => "The bundled plugins are already installed and current.".to_string(),
+                            Ok(done) => format!("Installed {}", done.join(", ")),
+                            Err(e) => format!("Couldn't install the bundled plugins: {e:#}"),
+                        };
+                        crate::plugins::rescan(cx);
+                        this.set_notice(msg, cx);
+                    }))),
+            )
+            .child(list)
+    }
+
+    /// Run a plugin in `env` (a manifest choice), or in the first usable one for `None`.
+    fn set_plugin_env(&mut self, id: &str, env: Option<String>, cx: &mut Context<Self>) {
+        let result = settings::update_shared(|s| {
+            let entry = s.plugins.entry(id.to_string()).or_default();
+            match env {
+                Some(e) => {
+                    entry.insert("env".into(), e);
+                }
+                None => {
+                    entry.remove("env");
+                }
+            }
+        });
+        self.settings.plugins = settings::shared().plugins;
+        if let Err(e) = result {
+            self.set_notice(format!("Settings not saved: {e:#}"), cx);
+        }
+        cx.notify();
     }
 }
 

@@ -32,6 +32,8 @@ fn limit(service: &str) -> usize {
     match service {
         // NCBI asks for one search at a time from a client.
         "ncbi" => 1,
+        // Plugins mostly want the whole GPU (or all the RAM): one at a time.
+        "plugin" => 1,
         _ => 4,
     }
 }
@@ -133,6 +135,11 @@ impl TaskCtx {
     #[cfg(test)]
     pub fn for_test(tx: async_channel::Sender<Msg>) -> TaskCtx {
         TaskCtx { tx, cancel: Arc::new(AtomicBool::new(false)), started: Instant::now() }
+    }
+
+    #[cfg(test)]
+    pub fn cancel_for_test(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
     fn line(&self, text: &str, kind: LogKind) {

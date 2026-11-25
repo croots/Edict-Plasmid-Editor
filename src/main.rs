@@ -17,6 +17,7 @@ mod model;
 mod notify;
 mod panes;
 mod pgx;
+mod plugins;
 mod sbol;
 mod settings;
 mod tasks;
@@ -47,6 +48,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         tasks::init(cx);
+        plugins::init(cx);
         workspace::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1400.0), px(900.0)), cx);
         cx.open_window(

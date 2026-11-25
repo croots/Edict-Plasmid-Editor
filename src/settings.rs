@@ -24,11 +24,14 @@ pub struct Settings {
     /// The Restriction pane's Favorites list, by enzyme name; None until first changed
     /// (the pane then offers a starter set).
     pub favorite_enzymes: Option<Vec<String>>,
+    /// Per plugin (by id): its settings' last values, and `env` when the user chose
+    /// the Python environment. Saved as `plugin.<id>.<key> = value` lines.
+    pub plugins: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new(), author: None, email: None, blast: BTreeMap::new(), favorite_enzymes: None }
+        Self { theme: DEFAULT_THEME_ID.into(), custom_theme_paths: Vec::new(), author: None, email: None, blast: BTreeMap::new(), favorite_enzymes: None, plugins: BTreeMap::new() }
     }
 }
 
@@ -65,6 +68,11 @@ impl Settings {
                 k if k.starts_with("blast.") && k.len() > "blast.".len() => {
                     s.blast.insert(k["blast.".len()..].to_string(), value.to_string());
                 }
+                k if k.starts_with("plugin.") => {
+                    if let Some((id, key)) = k["plugin.".len()..].split_once('.').filter(|(i, k)| !i.is_empty() && !k.is_empty()) {
+                        s.plugins.entry(id.to_string()).or_default().insert(key.to_string(), value.to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -88,6 +96,11 @@ impl Settings {
         }
         for (k, v) in &self.blast {
             out.push_str(&format!("blast.{k} = {}\n", v.replace('\n', " ")));
+        }
+        for (id, values) in &self.plugins {
+            for (k, v) in values {
+                out.push_str(&format!("plugin.{id}.{k} = {}\n", v.replace('\n', " ")));
+            }
         }
         out
     }
@@ -149,6 +162,11 @@ mod tests {
             email: Some("ada@example.org".into()),
             blast: [("program".to_string(), "blastx".to_string()), ("organism".to_string(), "Homo sapiens (taxid:9606)".to_string())].into(),
             favorite_enzymes: Some(vec!["EcoRI".into(), "BsaI".into()]),
+            plugins: [(
+                "esmfold2".to_string(),
+                [("env".to_string(), "conda:esm".to_string()), ("chunk.size".to_string(), "64".to_string())].into(),
+            )]
+            .into(),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
