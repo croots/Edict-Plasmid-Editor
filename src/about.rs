@@ -279,7 +279,7 @@ impl Render for AboutPanel {
                                 div()
                                     .text_xs()
                                     .text_color(theme::muted_text())
-                                    .child("A DNA sequence editor built on GPUI. Third-party software and licenses:"),
+                                    .child("A DNA sequence editor built on GPUI. Copyright \u{a9} 2026 Cameron Roots; free for noncommercial academic use (see LICENSE). Third-party software and licenses:"),
                             ),
                     )
                     .child(

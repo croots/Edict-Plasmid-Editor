@@ -3,6 +3,7 @@ name = "edict"
 version = "0.1.0"
 edition = "2021"
 description = "A GPU-rendered DNA sequence editor"
+license-file = "LICENSE"
 publish = false
 
 [dependencies]

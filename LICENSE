@@ -1,0 +1,166 @@
+Edict Academic Noncommercial License
+Version 1.0
+
+Copyright (c) 2026 Cameron Roots. All rights reserved except as granted below.
+
+This is a source-available license. It is not an open source license as
+defined by the Open Source Initiative: it does not permit commercial use.
+
+
+1. Definitions
+
+"Licensor" means Cameron Roots, the copyright holder of the Software.
+
+"Software" means the Edict source code, object code, documentation, sample
+files and other materials that the Licensor makes available under this
+License, and any portion of them.
+
+"Derivative Work" means any work that is based on, modified from, or
+incorporates all or a substantial portion of the Software.
+
+"You" means the individual or Academic Institution exercising rights under
+this License. If You use the Software on behalf of an Academic Institution,
+"You" includes that institution.
+
+"Academic Institution" means an accredited, degree-granting educational
+institution, or a nonprofit organization whose primary purpose is scientific
+research or education, in each case acting in its nonprofit capacity.
+
+"Noncommercial Academic Use" means use for teaching, learning, scholarship or
+academic research, carried out by a student, faculty member, researcher or
+staff member of an Academic Institution, or by an individual for their own
+education, where neither the use nor its results are offered for sale,
+licensed for a fee, or provided to any person for that person's commercial
+advantage. Publishing the results of such research, including in journals,
+theses, preprints, patents filed by an Academic Institution, and openly
+shared data, does not by itself make a use commercial.
+
+"Commercial Use" means any use that is not Noncommercial Academic Use. It
+includes, without limitation:
+  (a) use by, or on behalf of, a for-profit entity, including a for-profit
+      entity's employees and contractors acting in that role;
+  (b) use to provide a product or a paid service to another person, including
+      contract research, fee-for-service work, consulting, or hosting the
+      Software as a service;
+  (c) use in research whose results a for-profit entity has a right, under
+      contract or sponsorship, to receive before publication or to own or
+      license exclusively; and
+  (d) selling, licensing, renting or otherwise charging for the Software or a
+      Derivative Work, or bundling either with a product that is sold.
+
+
+2. License grant
+
+Subject to Your compliance with this License, the Licensor grants You a
+worldwide, royalty-free, non-exclusive, non-transferable license to:
+  (a) use, run, copy and study the Software;
+  (b) modify the Software and create Derivative Works; and
+  (c) distribute copies of the Software and of Derivative Works, in source or
+      object form,
+in each case solely for Noncommercial Academic Use.
+
+
+3. Conditions of redistribution
+
+If You distribute the Software or a Derivative Work, You must:
+  (a) give every recipient a copy of this License, and license the Software
+      and Your Derivative Work to them under the terms of this License, with
+      no additional restrictions;
+  (b) keep intact all copyright, license, attribution and disclaimer notices
+      in the Software;
+  (c) state, in any file You modified, that You changed it, and identify a
+      Derivative Work as modified from Edict; and
+  (d) not charge any fee for the Software or the Derivative Work, other than
+      a reasonable charge to cover the physical cost of the medium it is
+      delivered on.
+
+You may license Your own modifications, to the extent they are Your original
+work and separable from the Software, under any terms You choose, provided
+that the Software and any Derivative Work as a whole remain subject to this
+License.
+
+
+4. Patents
+
+The Licensor grants You a license, under any patent claims the Licensor can
+license that are necessarily infringed by the Software as provided, to make,
+use and run the Software for Noncommercial Academic Use. If You, or anyone
+acting on Your behalf, bring a claim alleging that the Software infringes a
+patent, every license granted to You under this License ends immediately.
+
+
+5. Commercial use
+
+This License grants no right to Commercial Use. Commercial Use requires a
+separate written license from the Licensor. If You are unsure whether Your
+use is noncommercial, ask the Licensor before relying on this License.
+
+
+6. Your data
+
+The Licensor claims no rights in the sequences, annotations, structures,
+files or other data You create, open or edit with the Software, or in the
+scientific results You obtain from using it.
+
+
+7. Names and trademarks
+
+This License does not grant any right to use the name "Edict", the Licensor's
+name, or any logo or trademark of the Licensor, except as needed to state
+truthfully that a Derivative Work is derived from Edict and to reproduce the
+notices required by Section 3. You may not use them to suggest that the
+Licensor endorses You or Your Derivative Work.
+
+
+8. Third-party components
+
+The Software includes or links to components made by others, such as those
+listed in the licenses/ directory and in the application's About panel. Each
+of those components is governed by its own license, and nothing in this
+License limits Your rights under those licenses.
+
+
+9. Termination
+
+Your rights under this License end automatically if You fail to comply with
+any of its terms. If it is Your first violation and You cure it within 30
+days after becoming aware of it, Your rights are reinstated. Recipients who
+received the Software from You in compliance with this License keep their
+rights so long as they comply. Sections 6, 10, 11 and 12 survive
+termination.
+
+
+10. Disclaimer of warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. THE ENTIRE RISK
+AS TO THE QUALITY, ACCURACY AND PERFORMANCE OF THE SOFTWARE, AND OF ANY
+SEQUENCE, ANNOTATION, ALIGNMENT, STRUCTURE PREDICTION OR OTHER RESULT IT
+PRODUCES, IS WITH YOU. THE SOFTWARE IS A RESEARCH TOOL. IT IS NOT DESIGNED,
+VALIDATED OR INTENDED FOR CLINICAL, DIAGNOSTIC, THERAPEUTIC OR OTHER MEDICAL
+USE, AND YOU MUST NOT RELY ON IT FOR SUCH USE.
+
+
+11. Limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR OR ANY CONTRIBUTOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY OR
+CONSEQUENTIAL (INCLUDING LOSS OF DATA, LOSS OF RESEARCH, LOSS OF PROFITS OR
+BUSINESS INTERRUPTION), HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY OR TORT (INCLUDING NEGLIGENCE),
+ARISING IN ANY WAY OUT OF THE USE OF OR INABILITY TO USE THE SOFTWARE, EVEN
+IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+12. General
+
+This License is the entire agreement between You and the Licensor about the
+Software and supersedes any prior understanding on that subject. If any
+provision of this License is held unenforceable, it shall be reformed only to
+the extent necessary to make it enforceable, and the remaining provisions
+stay in effect. No failure or delay by the Licensor in enforcing any right is
+a waiver of that right. The Licensor reserves all rights not expressly
+granted in this License. Using, modifying or distributing the Software means
+You accept this License.

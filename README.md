@@ -2,6 +2,8 @@
 
 Edict is a fast, GPU-rendered editor for plasmids and other DNA sequences, built on [GPUI](https://crates.io/crates/gpui) (Zed's UI framework). It opens GenBank, FASTA and SnapGene files and saves to its own `.edna` format, which keeps a full edit history and attached 3D structures alongside the sequence.
 
+Edict is free for noncommercial academic use. See [License](#license).
+
 ## Run
 
 ```sh
@@ -152,3 +154,9 @@ history/revisions.json save points: [{rev, time, author?, label?}]
 - **Safe reading.** Entries are read in memory and size-capped. Nothing is extracted to disk.
 
 `samples/sample-d.dna` is a test file from [Biopython](https://github.com/biopython/biopython/tree/master/Tests/SnapGene) (Biopython License / BSD 3-Clause).
+
+## License
+
+Edict is source-available under the [Edict Academic Noncommercial License](LICENSE). In short: students, researchers and staff at universities and nonprofit research institutions, and individuals learning on their own, may use, modify and redistribute Edict free of charge for noncommercial academic teaching and research, as long as the license and copyright notice go with it and nothing is charged for it. Commercial use, including any use by or for a for-profit company, needs a separate license from the copyright holder.
+
+This summary is for convenience; the [LICENSE](LICENSE) file is what governs. Third-party components keep their own licenses (see `licenses/` and the About panel).
