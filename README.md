@@ -2,7 +2,11 @@
 
 Edict is a fast, GPU-rendered editor for plasmids and other DNA sequences, built on [GPUI](https://crates.io/crates/gpui) (Zed's UI framework). It opens GenBank, FASTA and SnapGene files and saves to its own `.edna` format, which keeps a full edit history and attached 3D structures alongside the sequence.
 
-![Edict editing pEGFP-N1: the sequence with its translated features, the EGFP crystal structure (PDB 2Y0G) linked to the CDS, and a circular map](docs/screenshot.png)
+
+
+https://github.com/user-attachments/assets/ce45c983-ef63-4e29-ab27-d03fb6dc3b7c
+
+
 
 Edict is free for noncommercial academic use. See [License](#license).
 
