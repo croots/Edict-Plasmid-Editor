@@ -129,6 +129,8 @@ struct ContextMenu {
     /// The structures linked to the right-clicked feature: (id, name).
     structures: Vec<(String, String)>,
     plugins_open: bool,
+    /// The mouse is over the Plugins submenu, which lies outside the menu's own bounds.
+    over_plugins: bool,
 }
 
 /// A selected span in sequence coordinates. `start > end` only on a circular
@@ -765,7 +767,7 @@ impl SeqEditor {
     fn open_menu(&mut self, position: Point<Pixels>, feature: Option<usize>) {
         self.dragging = false;
         let structures = feature.map(|fi| self.linked_structures(fi)).unwrap_or_default();
-        self.menu = Some(ContextMenu { position, selection: !self.selection().is_empty(), feature, structures, plugins_open: false });
+        self.menu = Some(ContextMenu { position, selection: !self.selection().is_empty(), feature, structures, plugins_open: false, over_plugins: false });
     }
 
     /// Close the menu, run one of its commands, and redraw.
@@ -948,6 +950,11 @@ impl SeqEditor {
                         .top(px(-5.0))
                         .left_full()
                         .ml_1()
+                        .on_hover(cx.listener(|this, hovered: &bool, _, _| {
+                            if let Some(m) = this.menu.as_mut() {
+                                m.over_plugins = *hovered;
+                            }
+                        }))
                         .children(plugin_items),
                 )
             });
@@ -958,6 +965,10 @@ impl SeqEditor {
                     menu_panel()
                         .id("editor-context-menu")
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            // The submenu hangs outside this panel; a press on it is not "outside".
+                            if this.menu.as_ref().is_some_and(|m| m.over_plugins) {
+                                return;
+                            }
                             this.menu = None;
                             cx.notify();
                         }))
