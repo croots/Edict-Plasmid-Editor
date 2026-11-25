@@ -312,6 +312,7 @@ impl TaskRunner for PluginRunner {
             bail!("the result file {:?} isn't in the run's folder", r.file);
         }
         let data = std::fs::read(&file).with_context(|| format!("reading the result {}", r.file))?;
+        self.check_structure(&data, &format)?;
         let metrics = r.metrics.iter().filter_map(|(k, v)| v.as_f64().map(|v| (k.clone(), v))).collect();
         ctx.log(format!("Finished in {:.1} s", elapsed.as_secs_f64()));
         Ok(Arc::new(PluginOutput {
@@ -324,6 +325,25 @@ impl TaskRunner for PluginRunner {
             elapsed,
             workdir: self.workdir.clone(),
         }))
+    }
+}
+
+impl PluginRunner {
+    /// The structure must parse, and every protein sent must come back as one of its
+    /// chains, residue for residue; otherwise it can't be linked to the feature.
+    fn check_structure(&self, data: &[u8], format: &str) -> Result<()> {
+        use crate::structure::{chain_letters, Molecule};
+        let fmt = if format == "pdb" { crate::pgx::StructureFormat::Pdb } else { crate::pgx::StructureFormat::Mmcif };
+        let mol = Molecule::parse(data, fmt).context("the plugin's structure doesn't parse")?;
+        let chains: Vec<Vec<u8>> = (0..mol.chains.len()).map(|ci| chain_letters(&mol, ci).0.to_ascii_uppercase()).collect();
+        let sent = self.request["input"]["sequences"].as_array().cloned().unwrap_or_default();
+        for s in sent {
+            let (id, seq) = (s["id"].as_str().unwrap_or("?"), s["seq"].as_str().unwrap_or_default());
+            if !chains.iter().any(|c| c == seq.to_ascii_uppercase().as_bytes()) {
+                bail!("the plugin's structure has no chain matching protein {id} ({} aa) as sent", seq.len());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -401,11 +421,33 @@ mod tests {
         let (out, msgs) = run_script(
             r#"
 import plasmid, sys
+CIF = """data_mkv
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_asym_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 C CA MET A 1 1 0.0 0.0 0.0 1.00 90 1 A 1
+ATOM 2 C CA LYS A 1 2 3.8 0.0 0.0 1.00 80 2 A 1
+ATOM 3 C CA VAL A 1 3 7.6 0.0 0.0 1.00 70 3 A 1
+"""
 req = plasmid.request()
 assert req["input"]["sequences"][0]["seq"] == "MKV"
 print("hello from the plugin")
 plasmid.progress("Folding", 0.5)
-open("pred.cif", "w").write("data_x\n")
+open("pred.cif", "w").write(CIF)
 plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], metrics={"ptm": 0.8}, plddt=[90, 80, 70])
 "#,
             None,
@@ -414,7 +456,7 @@ plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], 
             return;
         }
         let out = out.unwrap().downcast::<PluginOutput>().ok().unwrap();
-        assert_eq!(out.data, b"data_x\n");
+        assert!(out.data.starts_with(b"data_mkv"));
         assert_eq!(out.chains, vec!["A"]);
         assert_eq!(out.metrics, vec![("ptm".to_string(), 0.8)]);
         assert_eq!(out.plddt, vec![90.0, 80.0, 70.0]);
@@ -439,6 +481,14 @@ plasmid.result(kind="structure", file="pred.cif", format="mmcif", chains=["A"], 
         assert!(out.err().unwrap().to_string().contains("isn't in the run's folder"));
         let (out, _) = run_script("pass\n", None);
         assert!(out.err().unwrap().to_string().contains("without giving a result"));
+        // A structure of some other protein (the demo's helix of "MKVL", not "MKV").
+        let (_, helix) = crate::plugins::BUNDLED.iter().find(|(id, _)| *id == "ideal-helix").unwrap();
+        let wrong = serde_json::json!({"api": 1, "settings": {"rise": 1.5, "delay": "0"},
+            "input": {"sequences": [{"id": "A", "seq": "MKV"}], "feature": {"label": "x", "kind": "CDS"}}});
+        let lying = helix.replace("seq = chain[\"seq\"]", "seq = chain[\"seq\"] + \"L\"");
+        assert_ne!(&lying, helix);
+        let (out, _) = run_with(&lying, wrong, None);
+        assert!(out.err().unwrap().to_string().contains("no chain matching protein A"));
     }
 
     #[test]

@@ -9,7 +9,11 @@ nix develop                     # Rust toolchain, Zig 0.17 (for libghostty-vt), 
 cargo run --release -- samples  # explorer root; optional second arg opens a file
 ```
 
-### ESMFold2 (structure prediction, groundwork for a plugin)
+### ESMFold2 (structure prediction)
+
+The usual way to run ESMFold2 is the bundled plugin. Install it from Settings → Plugins,
+then right-click a CDS or ORF → Plugins → Predict structure with ESMFold2…. It runs in this
+flake's `esmfold2-env`. The CLI below uses the same build.
 
 `nix/esmfold2.nix` builds Biohub's [`esm`](https://github.com/Biohub/esm) 3.5.0 against nixpkgs'
 ROCm torch (prebuilt on cache.nixos.org; ~5 GB download) and wraps it in `esmfold2-predict`:
@@ -18,6 +22,7 @@ ROCm torch (prebuilt on cache.nixos.org; ~5 GB download) and wraps it in `esmfol
 nix run .#esmfold2 -- -s MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG -o ubq.cif
 nix run .#esmfold2 -- -f chains.fasta -o complex.cif --model biohub/ESMFold2   # each record is a chain
 nix develop .#esmfold2          # Python with `esm` importable
+nix build .#esmfold2-env        # just that Python (what the plugin runs in)
 nix build .#esmfold2-cpu        # torch without ROCm (very slow for a 7B model)
 ```
 
@@ -62,6 +67,12 @@ reports capability 11.0, which esm's fp8 check would otherwise accept but cannot
     - an editable `/note`: "Identified by BLASTX against nr on 2026-11-23 by ‹author›: …, 98.8% identity over 240 aa, E-value 3e-150."
 
   Results live in memory only. NCBI keeps its own report for about 36 hours.
+- **Plugins** (right-click a feature → Plugins): Python scripts that act on a feature. The two bundled ones predict a protein's structure (ESMFold2, and an ideal-helix demo that needs nothing installed). Each lives in `~/.config/plasmid-gpui/plugins/<id>/plugin.py` and says in its header which Python environments it can run in (uv, venv, conda, nix or a plain interpreter), what it offers, and its settings. Running one works like BLAST:
+  - a settings form, remembered between runs
+  - the plugin's live terminal output, which you can background or cancel (cancelling stops its child processes too)
+  - a result card with its scores (pTM, pLDDT) and a per-residue confidence strip, from which you **Attach** the structure to the feature (it opens in a 3D pane, coloured by confidence), **Save** the file, or dismiss it
+
+  A memory guard stops a run before the machine runs out of RAM. **Settings → Plugins** lists the installed plugins, which environment each will use (and lets you pick another), and any that failed to load; it also installs the bundled ones. [`plugins/README.md`](plugins/README.md) explains how to write one.
 - **Locked regions**: the bases a task is using stay locked until its results are dismissed, or until it fails or is cancelled. This keeps results from drifting out of step with the sequence.
   - Locked bases are tinted with a bar above them, and shown as a band on maps.
   - Typing, deleting, pasting, cutting, undo/redo and reverts that would change them are refused, with a note in the status bar.
@@ -69,7 +80,7 @@ reports capability 11.0, which esm's fp8 check would otherwise accept but cannot
   - Clicking locked bases (or the band on a map) brings their task forward; where locks overlap, a menu asks which. A drag that starts outside still selects through them.
 - **Tasks** (bottom of the explorer): running, queued and finished tasks. Click one to show it (its file's tab comes forward too). `×` cancels a running task and clears a finished one. Escape sends the shown task to the background. A task that finishes out of view is highlighted until you open it, and if the window isn't focused a desktop notification says so. Closing a tab or quitting asks first if tasks would be lost.
 - **Menu** (☰, top left of the explorer): New File (Ctrl+N), Open File… (Ctrl+O), Open Folder… (Ctrl+Shift+O), Save (Ctrl+S), Save As… (Ctrl+Shift+S), Export As… (Ctrl+E), Close Tab (Ctrl+W), Toggle Full Screen (F11; also ⌃⌘F on macOS), Settings… (Ctrl+,), About… (version and third-party licenses), Quit (Ctrl+Q; asks first if files are unsaved). New files are in memory until their first save, which asks where to put them. The extension you pick (`.pgx`, `.gb` or `.fa`) sets the format; a name without one becomes `.pgx`. Export As writes a copy in any writable format while the tab keeps editing the original.
-- **Settings** (Ctrl+,): the **Appearance** page picks a theme and adds custom base16 schemes; the **Hotkeys** page lists every keyboard and mouse shortcut, grouped by where it applies (general, panes, sequence editor, terminal, 3D structure); the **Keys** page holds the email address BLAST sends to NCBI (with `tool=plasmid-gpui`), as NCBI's usage rules ask. BLAST won't run without it.
+- **Settings** (Ctrl+,): the **Appearance** page picks a theme and adds custom base16 schemes; the **Hotkeys** page lists every keyboard and mouse shortcut, grouped by where it applies (general, panes, sequence editor, terminal, 3D structure); the **Keys** page holds the email address BLAST sends to NCBI (with `tool=plasmid-gpui`), as NCBI's usage rules ask. BLAST won't run without it. The **Plugins** page is described above.
 - **Saving other formats**: Ctrl+S on a GenBank, FASTA or SnapGene file asks first. **Convert** writes `name.pgx` beside the original, leaves the original untouched and switches the tab to the new file. **Keep** saves in the original format and warns what is lost: edit history for GenBank, plus features and topology for FASTA. Keep is not offered for SnapGene, which is read-only. The choice lasts for the tab. Choosing a format by name in Save As counts as a choice and does not ask.
 - **Settings → Theme**: the built-in light palette plus every base16 scheme from [tinted-theming/schemes](https://github.com/tinted-theming/schemes) (the successor to `chriskempson/base16-schemes-source`), with swatches and Dark/Light/Custom filters. Clicking applies it live.
 - **Settings → Custom base16 themes**: add a scheme `.yaml` file or a folder of them. Both the current tinted-theming layout (`palette: { base00: "#…" }`) and the original chriskempson layout (`base00: "…"`) parse. Reload picks up edits. Settings are kept in `$XDG_CONFIG_HOME/plasmid-gpui/settings.conf` (`~/.config/…` by default). Add `author = Your Name` there to choose the name the edit history records.
@@ -91,11 +102,17 @@ reports capability 11.0, which esm's fp8 check would otherwise accept but cannot
 | `src/terminal.rs` | Terminal pane: pty and reader thread, libghostty-vt render state painted as a cell grid, key encoding, scrollback. Unit-tested. |
 | `src/history.rs` | History pane: the change log grouped by save, each save's net effect (found by replaying the log backwards), finding where an old change is in the current sequence, and the right-click reverts. Unit-tested. |
 | `src/notify.rs` | Desktop notifications (D-Bus on Linux, `osascript` on macOS) for tasks that finish while the window is in the background. |
-| `src/tasks.rs` | Background tasks, shared by built-in features and, later, plugins: a runner on its own thread, per-service limits (one at a time for NCBI) with a FIFO queue, a log, cancelling, region locks and which task is in front. Unit-tested. |
+| `src/tasks.rs` | Background tasks, shared by built-in features and plugins: a runner on its own thread, per-service limits (one at a time for NCBI) with a FIFO queue, a log, cancelling, region locks and which task is in front. Unit-tested. |
 | `src/locks.rs` | Locked regions: how edits move them, which edits they refuse, and rotation on reindex. Unit-tested. |
 | `src/blast/mod.rs` | The NCBI BLAST URL API: options and their per-program defaults, the Put form, RID/status parsing, JSON2_S results, request throttling. Unit-tested; `cargo test live_search -- --ignored` with `BLAST_EMAIL` set runs a real search. |
 | `src/blast/results.rs` | Hit table sorting, NCBI-style alignment blocks, and the feature a match becomes. Unit-tested. |
 | `src/blast/dialog.rs` | The BLAST task's view: options form, run log, results table and alignments. |
+| `src/plugins/mod.rs` | The plugin registry: scanning the plugins folder, the actions offered for a feature kind, installing the bundled plugins. Unit-tested. |
+| `src/plugins/manifest.rs` | Reading a plugin's `[tool.plasmid]` header: environments, actions, typed settings. Unit-tested. |
+| `src/plugins/env.rs` | Turning an environment entry (uv, venv, conda, nix, python) into a command, or saying why it isn't usable. Unit-tested. |
+| `src/plugins/runner.rs` | Running a plugin as a task: scratch folder, pty, the event stream, cancelling the process group, checking the result. Tested against real Python when it is on `PATH`. |
+| `src/plugins/form.rs`, `dialog.rs` | The settings form built from the manifest, and the plugin task's view: form, terminal, result card, attach and save. |
+| `plugins/` | The bundled plugins (`esmfold2`, `ideal-helix`), the `plasmid.py` helper the app gives every run, and [the guide to writing one](plugins/README.md). |
 | `src/about.rs` | About panel: version, third-party notices and the crate license table. |
 | `licenses/` | License texts shown in About. `rust-crates.tsv` lists every linked Rust crate; regenerate it with `scripts/licenses.sh` after changing dependencies. |
 | `src/theme.rs` | Active theme (thread-local), base16 → UI color mapping, YAML scheme parser, bundled and custom theme loading. Unit-tested. |
